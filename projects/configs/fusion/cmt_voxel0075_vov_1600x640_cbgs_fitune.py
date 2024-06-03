@@ -32,22 +32,39 @@ ida_aug_conf = {
     }
 
 train_pipeline = [
+    dict(
+        type='LoadPointsFromFile',
+        coord_type='LIDAR',
+        load_dim=5,
+        use_dim=[0, 1, 2, 3, 4],
+    ),
+    dict(
+        type='LoadPointsFromMultiSweeps',
+        sweeps_num=10,
+        use_dim=[0, 1, 2, 3, 4],
+    ),
     dict(type='LoadMultiViewImageFromFiles'),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
-    dict(type='GlobalRotScaleTransImage',
-            rot_range=[-0.3925, 0.3925],
-            translation_std=[0, 0, 0],
-            scale_ratio_range=[0.95, 1.05],
-            reverse_angle=True,
-            training=True
-            ),
+    dict(type='ModalMask3D', mode='train'),
+    dict(
+        type='GlobalRotScaleTransAll',
+        rot_range=[-0.3925 * 2, 0.3925 * 2],
+        scale_ratio_range=[0.9, 1.1],
+        translation_std=[0.5, 0.5, 0.5]),
+    dict(
+        type='CustomRandomFlip3D',
+        sync_2d=False,
+        flip_ratio_bev_horizontal=0.5,
+        flip_ratio_bev_vertical=0.5),
+    dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='ObjectNameFilter', classes=class_names),
+    dict(type='PointShuffle'),
     dict(type='ResizeCropFlipImage', data_aug_conf = ida_aug_conf, training=True),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='PadMultiViewImage', size_divisor=32),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
-    dict(type='Collect3D', keys=['img', 'gt_bboxes_3d', 'gt_labels_3d'],
+    dict(type='Collect3D', keys=['points', 'img', 'gt_bboxes_3d', 'gt_labels_3d'],
          meta_keys=('filename', 'ori_shape', 'img_shape', 'lidar2img',
                     'depth2img', 'cam2img', 'pad_shape',
                     'scale_factor', 'flip', 'pcd_horizontal_flip',
@@ -58,6 +75,17 @@ train_pipeline = [
                     'gt_bboxes_3d', 'gt_labels_3d'))
 ]
 test_pipeline = [
+    dict(
+        type='LoadPointsFromFile',
+        coord_type='LIDAR',
+        load_dim=5,
+        use_dim=[0, 1, 2, 3, 4],
+    ),
+    dict(
+        type='LoadPointsFromMultiSweeps',
+        sweeps_num=10,
+        use_dim=[0, 1, 2, 3, 4],
+    ),
     dict(type='LoadMultiViewImageFromFiles'),
     dict(
         type='MultiScaleFlipAug3D',
@@ -65,6 +93,12 @@ test_pipeline = [
         pts_scale_ratio=1,
         flip=False,
         transforms=[
+            dict(
+                type='GlobalRotScaleTrans',
+                rot_range=[0, 0],
+                scale_ratio_range=[1.0, 1.0],
+                translation_std=[0, 0, 0]),
+            dict(type='RandomFlip3D'),
             dict(type='ResizeCropFlipImage', data_aug_conf = ida_aug_conf, training=False),
             dict(type='NormalizeMultiviewImage', **img_norm_cfg),
             dict(type='PadMultiViewImage', size_divisor=32),
@@ -72,7 +106,7 @@ test_pipeline = [
                 type='DefaultFormatBundle3D',
                 class_names=class_names,
                 with_label=False),
-            dict(type='Collect3D', keys=['img'])
+            dict(type='Collect3D', keys=['points', 'img'])
         ])
 ]
 data = dict(
@@ -112,6 +146,7 @@ data = dict(
         box_type_3d='LiDAR'))
 model = dict(
     type='CmtDetector',
+    use_grid_mask=True,
     img_backbone=dict(
         type='VoVNetCP',
         spec_name='V-99-eSE',
@@ -124,13 +159,48 @@ model = dict(
         in_channels=[768, 1024],
         out_channels=256,
         num_outs=2),
+    pts_voxel_layer=dict(
+        num_point_features=5,
+        max_num_points=10,
+        voxel_size=voxel_size,
+        max_voxels=(120000, 160000),
+        point_cloud_range=point_cloud_range),
+    pts_voxel_encoder=dict(
+        type='HardSimpleVFE',
+        num_features=5,
+    ),
+    pts_middle_encoder=dict(
+        type='SparseEncoder',
+        in_channels=5,
+        sparse_shape=[41, 1440, 1440],
+        output_channels=128,
+        order=('conv', 'norm', 'act'),
+        encoder_channels=((16, 16, 32), (32, 32, 64), (64, 64, 128), (128, 128)),
+        encoder_paddings=((0, 0, 1), (0, 0, 1), (0, 0, [0, 1, 1]), (0, 0)),
+        block_type='basicblock'),
+    pts_backbone=dict(
+        type='SECOND',
+        in_channels=256,
+        out_channels=[128, 256],
+        layer_nums=[5, 5],
+        layer_strides=[1, 2],
+        norm_cfg=dict(type='BN', eps=0.001, momentum=0.01),
+        conv_cfg=dict(type='Conv2d', bias=False)),
+    pts_neck=dict(
+        type='SECONDFPN',
+        in_channels=[128, 256],
+        out_channels=[256, 256],
+        upsample_strides=[1, 2],
+        norm_cfg=dict(type='BN', eps=0.001, momentum=0.01),
+        upsample_cfg=dict(type='deconv', bias=False),
+        use_conv_for_no_stride=True),
     pts_bbox_head=dict(
-        type='CmtImageHead',
+        type='CmtHead',
         in_channels=512,
         hidden_dim=256,
         downsample_scale=8,
         common_heads=dict(center=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2)),
-         tasks=[
+        tasks=[
             dict(num_class=10, class_names=[
                 'car', 'truck', 'construction_vehicle',
                 'bus', 'trailer', 'barrier',
@@ -148,7 +218,7 @@ model = dict(
         separate_head=dict(
             type='SeparateTaskHead', init_bias=-2.19, final_kernel=1),
         transformer=dict(
-            type='CmtImageTransformer',
+            type='CmtTransformer',
             decoder=dict(
                 type='PETRTransformerDecoder',
                 return_intermediate=True,
@@ -230,8 +300,7 @@ optimizer_config = dict(
     type='CustomFp16OptimizerHook',
     loss_scale='dynamic',
     grad_clip=dict(max_norm=35, norm_type=2),
-)
-
+    custom_fp16=dict(pts_voxel_encoder=False, pts_middle_encoder=False, pts_bbox_head=False))
 lr_config = dict(
     policy='cyclic',
     target_ratio=(8, 0.0001),
@@ -243,7 +312,7 @@ momentum_config = dict(
     cyclic_times=1,
     step_ratio_up=0.4)
 total_epochs = 20
-checkpoint_config = dict(interval=1)
+checkpoint_config = dict(interval=1, max_keep_ckpts=3)
 log_config = dict(
     interval=50,
     hooks=[dict(type='TextLoggerHook'),
@@ -251,7 +320,7 @@ log_config = dict(
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 work_dir = None
-load_from='ckpts/fcos3d_vovnet_imgbackbone-remapped.pth'
-resume_from = None
+load_from = None
+resume_from = 'ckpts/fusion_1600/epoch_15.pth'
 workflow = [('train', 1)]
 gpu_ids = range(0, 8)

@@ -11,6 +11,13 @@
 import numpy as np
 from mmdet.datasets import DATASETS
 from mmdet3d.datasets import NuScenesDataset
+from os import path as osp
+import pandas as pd
+from refile import smart_open
+from prettytable import PrettyTable
+import json
+
+import mmcv
 
 
 @DATASETS.register_module()
@@ -96,3 +103,93 @@ class CustomNuScenesDataset(NuScenesDataset):
             input_dict['ann_info'] = annos
 
         return input_dict
+
+    def _evaluate_single(self,
+                         result_path,
+                         logger=None,
+                         metric='bbox',
+                         result_name='pts_bbox'):
+        """Evaluation for a single model in nuScenes protocol.
+
+        Args:
+            result_path (str): Path of the result file.
+            logger (logging.Logger | str, optional): Logger used for printing
+                related information during evaluation. Default: None.
+            metric (str, optional): Metric name used for evaluation.
+                Default: 'bbox'.
+            result_name (str, optional): Result name in the metric prefix.
+                Default: 'pts_bbox'.
+
+        Returns:
+            dict: Dictionary of evaluation details.
+        """
+        from nuscenes import NuScenes
+        from nuscenes.eval.detection.evaluate import NuScenesEval
+
+        output_dir = osp.join(*osp.split(result_path)[:-1])
+        nusc = NuScenes(
+            version=self.version, dataroot=self.data_root, verbose=False)
+        eval_set_map = {
+            'v1.0-mini': 'mini_val',
+            'v1.0-trainval': 'val',
+        }
+        nusc_eval = NuScenesEval(
+            nusc,
+            config=self.eval_detection_configs,
+            result_path=result_path,
+            eval_set=eval_set_map[self.version],
+            output_dir=output_dir,
+            verbose=False)
+        nusc_eval.main(render_curves=False)
+
+        # record metrics
+        metrics = mmcv.load(osp.join(output_dir, 'metrics_summary.json'))
+        path = output_dir + "/metrics_summary.json"
+        with smart_open(path, "rb") as fr:
+            result = json.load(fr)
+
+            res_sumarry = PrettyTable()
+            res_sumarry.add_column(
+                "category",
+                ["car", "truck", "bus", "trailer", "construction_vehicle", "pedestrian", "motorcycle", "bicycle", "traffic_cone", "barrier", "over_all"]
+            )
+
+            ap_res = list(np.round(list(result["mean_dist_aps"].values()), 3)) + [round(result["mean_ap"], 4)]
+            res_sumarry.add_column("AP", ap_res)
+
+            label_tp_error_df = pd.DataFrame(result["label_tp_errors"])
+            label_tp_error_df_trans = label_tp_error_df.T
+            metric_name_map = {
+                "trans_err": "ATE",
+                "scale_err": "ASE",
+                "orient_err": "AOE",
+                "vel_err": "AVE",
+                "attr_err": "AAE",
+            }
+            tp_errors = result["tp_errors"]
+            for key in label_tp_error_df_trans.keys():
+                res_sumarry.add_column(metric_name_map[key], list(np.round(label_tp_error_df_trans[key].to_list(), 3)) + [round(tp_errors[key], 4)])
+
+            with open(output_dir + "/eval_result_sumarry.txt", "w") as fw:
+                fw.write(str(res_sumarry))
+                fw.write("\n")
+                fw.write("NDS: " + str(round(result["nd_score"], 4)))
+            print("Save Result Sumarry to: ", output_dir + "/eval_result_sumarry.txt")
+        
+        detail = dict()
+        metric_prefix = f'{result_name}_NuScenes'
+        for name in self.CLASSES:
+            for k, v in metrics['label_aps'][name].items():
+                val = float('{:.4f}'.format(v))
+                detail['{}/{}_AP_dist_{}'.format(metric_prefix, name, k)] = val
+            for k, v in metrics['label_tp_errors'][name].items():
+                val = float('{:.4f}'.format(v))
+                detail['{}/{}_{}'.format(metric_prefix, name, k)] = val
+            for k, v in metrics['tp_errors'].items():
+                val = float('{:.4f}'.format(v))
+                detail['{}/{}'.format(metric_prefix,
+                                      self.ErrNameMapping[k])] = val
+
+        detail['{}/NDS'.format(metric_prefix)] = metrics['nd_score']
+        detail['{}/mAP'.format(metric_prefix)] = metrics['mean_ap']
+        return detail

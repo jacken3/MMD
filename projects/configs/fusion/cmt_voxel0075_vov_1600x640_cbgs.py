@@ -188,7 +188,7 @@ model = dict(
     type='CmtDetector',
     use_grid_mask=True,
     img_backbone=dict(
-        type='VoVNet',
+        type='VoVNetCP',
         spec_name='V-99-eSE',
         norm_eval=True,
         frozen_stages=-1,
@@ -265,7 +265,7 @@ model = dict(
                 num_layers=6,
                 transformerlayers=dict(
                     type='PETRTransformerDecoderLayer',
-                    with_cp=False,
+                    with_cp=True,
                     attn_cfgs=[
                         dict(
                             type='MultiheadAttention',
@@ -352,7 +352,7 @@ momentum_config = dict(
     cyclic_times=1,
     step_ratio_up=0.4)
 total_epochs = 20
-checkpoint_config = dict(interval=1)
+checkpoint_config = dict(interval=1, max_keep_ckpts=3)
 log_config = dict(
     interval=50,
     hooks=[dict(type='TextLoggerHook'),
