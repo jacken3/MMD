@@ -16,6 +16,7 @@ from mmdet.datasets.builder import PIPELINES
 from mmdet.datasets.pipelines import RandomFlip
 from mmdet3d.core.bbox import box_np_ops
 from mmdet3d.datasets.builder import OBJECTSAMPLERS
+from PIL import Image
 
 
 @PIPELINES.register_module()
@@ -340,17 +341,13 @@ class ResizeCropFlipImage(object):
         new_depths = []
         resize, resize_dims, crop, flip, rotate = self._sample_augmentation()
         for i in range(N):
-            post_rot = torch.eye(2)
-            post_tran = torch.zeros(2)
-            img = imgs[i]
+            img = Image.fromarray(np.uint8(imgs[i]))
 
             # augmentation (resize, crop, horizontal flip, rotate)
             if self.pic_wise:
                 resize, resize_dims, crop, flip, rotate = self._sample_augmentation()
-            img, post_rot2, post_tran2 = self._img_transform(
+            img, ida_mat = self._img_transform(
                 img,
-                post_rot,
-                post_tran,
                 resize=resize,
                 resize_dims=resize_dims,
                 crop=crop,
@@ -369,9 +366,8 @@ class ResizeCropFlipImage(object):
                 )
                 new_depths.append(depth.astype(np.float32))
 
-            new_imgs.append(img)
-            results['cam_intrinsic'][i][:2, :3] = post_rot2 @ results['cam_intrinsic'][i][:2, :3]
-            results['cam_intrinsic'][i][:2, 2] = post_tran2 + results['cam_intrinsic'][i][:2, 2]
+            new_imgs.append(np.array(img).astype(np.float32))
+            results['cam_intrinsic'][i][:3, :3] = ida_mat @ results['cam_intrinsic'][i][:3, :3]
 
         results["img"] = new_imgs
         results["depths"] = new_depths
@@ -388,49 +384,33 @@ class ResizeCropFlipImage(object):
             ]
         )
 
-    def _img_transform(self, img, post_rot, post_tran, resize, resize_dims, crop, flip, rotate):
+    def _img_transform(self, img, resize, resize_dims, crop, flip, rotate):
+        ida_rot = torch.eye(2)
+        ida_tran = torch.zeros(2)
         # adjust image
-        resized_img = cv2.resize(img, resize_dims)
-        img = np.zeros((crop[3] - crop[1], crop[2] - crop[0], 3))
-        
-        hsize, wsize = crop[3] - crop[1], crop[2] - crop[0]
-        dh, dw, sh, sw = crop[1], crop[0], 0, 0
-        
-        if dh < 0:
-            sh = -dh
-            hsize += dh
-            dh = 0
-        if dh + hsize > resized_img.shape[0]:
-            hsize = resized_img.shape[0] - dh
-        if dw < 0:
-            sw = -dw
-            wsize += dw
-            dw = 0
-        if dw + wsize > resized_img.shape[1]:
-            wsize = resized_img.shape[1] - dw
-        img[sh : sh + hsize, sw : sw + wsize] = resized_img[dh: dh + hsize, dw: dw + wsize]
-        
-        (h, w) = img.shape[:2]
-        center = (w / 2, h / 2)
+        img = img.resize(resize_dims)
+        img = img.crop(crop)
         if flip:
-            img = cv2.flip(img, 1)
-        M = cv2.getRotationMatrix2D(center, rotate, scale=1.0)
-        img = cv2.warpAffine(img, M, (w, h))
+            img = img.transpose(method=Image.FLIP_LEFT_RIGHT)
+        img = img.rotate(rotate)
+
         # post-homography transformation
-        post_rot *= resize
-        post_tran -= torch.Tensor(crop[:2])
+        ida_rot *= resize
+        ida_tran -= torch.Tensor(crop[:2])
         if flip:
             A = torch.Tensor([[-1, 0], [0, 1]])
             b = torch.Tensor([crop[2] - crop[0], 0])
-            post_rot = A.matmul(post_rot)
-            post_tran = A.matmul(post_tran) + b
+            ida_rot = A.matmul(ida_rot)
+            ida_tran = A.matmul(ida_tran) + b
         A = self._get_rot(rotate / 180 * np.pi)
         b = torch.Tensor([crop[2] - crop[0], crop[3] - crop[1]]) / 2
         b = A.matmul(-b) + b
-        post_rot = A.matmul(post_rot)
-        post_tran = A.matmul(post_tran) + b
-
-        return img, post_rot, post_tran
+        ida_rot = A.matmul(ida_rot)
+        ida_tran = A.matmul(ida_tran) + b
+        ida_mat = torch.eye(3)
+        ida_mat[:2, :2] = ida_rot
+        ida_mat[:2, 2] = ida_tran
+        return img, ida_mat
 
     def _sample_augmentation(self):
         H, W = self.data_aug_conf["H"], self.data_aug_conf["W"]

@@ -76,20 +76,18 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=2,
+    samples_per_gpu=1,
     workers_per_gpu=6,
     train=dict(
-        type='CBGSDataset',
-        dataset=dict(
-            type=dataset_type,
-            data_root=data_root,
-            ann_file=data_root + '/nuscenes_infos_train.pkl',
-            load_interval=1,
-            pipeline=train_pipeline,
-            classes=class_names,
-            modality=input_modality,
-            test_mode=False,
-            box_type_3d='LiDAR')),
+        type=dataset_type,
+        data_root=data_root,
+        ann_file=data_root + '/nuscenes_infos_train.pkl',
+        load_interval=1,
+        pipeline=train_pipeline,
+        classes=class_names,
+        modality=input_modality,
+        test_mode=False,
+        box_type_3d='LiDAR'),
     val=dict(
         type=dataset_type,
         data_root=data_root,
@@ -128,6 +126,8 @@ model = dict(
         type='CmtImageHead',
         in_channels=512,
         hidden_dim=256,
+        depth_num=1,
+        depth_start=54,
         downsample_scale=8,
         common_heads=dict(center=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2)),
          tasks=[
@@ -219,7 +219,7 @@ model = dict(
         )))
 optimizer = dict(
     type='AdamW',
-    lr=0.0001,
+    lr=0.00005,
     paramwise_cfg=dict(
         custom_keys={
             'img_backbone': dict(lr_mult=0.01, decay_mult=5),
@@ -243,7 +243,7 @@ momentum_config = dict(
     cyclic_times=1,
     step_ratio_up=0.4)
 total_epochs = 20
-checkpoint_config = dict(interval=1)
+checkpoint_config = dict(interval=1, max_keep_ckpts=2)
 log_config = dict(
     interval=50,
     hooks=[dict(type='TextLoggerHook'),

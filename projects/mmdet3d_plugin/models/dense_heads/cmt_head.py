@@ -48,6 +48,20 @@ def pos2embed(pos, num_pos_feats=128, temperature=10000):
     posemb = torch.cat((pos_y, pos_x), dim=-1)
     return posemb
 
+def pos2emb3d(pos, num_pos_feats=128, temperature=10000):
+    scale = 2 * math.pi
+    pos = pos * scale
+    dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=pos.device)
+    dim_t = temperature ** (2 * torch.div(dim_t, 2, rounding_mode='floor') / num_pos_feats)
+    pos_x = pos[..., 0, None] / dim_t
+    pos_y = pos[..., 1, None] / dim_t
+    pos_z = pos[..., 2, None] / dim_t
+    pos_x = torch.stack((pos_x[..., 0::2].sin(), pos_x[..., 1::2].cos()), dim=-1).flatten(-2)
+    pos_y = torch.stack((pos_y[..., 0::2].sin(), pos_y[..., 1::2].cos()), dim=-1).flatten(-2)
+    pos_z = torch.stack((pos_z[..., 0::2].sin(), pos_z[..., 1::2].cos()), dim=-1).flatten(-2)
+    posemb = torch.cat((pos_y, pos_x, pos_z), dim=-1)
+    return posemb
+
 
 class LayerNormFunction(torch.autograd.Function):
 
@@ -211,6 +225,9 @@ class CmtHead(BaseModule):
                  hidden_dim=128,
                  depth_num=64,
                  norm_bbox=True,
+                 if_depth_pe=False,
+                 share_pe=False,
+                 depth_start=1,
                  downsample_scale=8,
                  scalar=10,
                  noise_scale=1.0,
@@ -268,6 +285,9 @@ class CmtHead(BaseModule):
         self.bbox_noise_trans = noise_trans
         self.dn_weight = dn_weight
         self.split = split
+        self.if_depth_pe = if_depth_pe
+        self.share_pe = share_pe
+        self.depth_start = depth_start
 
         self.loss_cls = build_loss(loss_cls)
         self.loss_bbox = build_loss(loss_bbox)
@@ -289,15 +309,23 @@ class CmtHead(BaseModule):
         self.transformer = build_transformer(transformer)
         self.reference_points = nn.Embedding(num_query, 3)
         self.bev_embedding = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Linear(hidden_dim * 3 // 2, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim)
         )
-        self.rv_embedding = nn.Sequential(
-            nn.Linear(self.depth_num * 3, self.hidden_dim * 4),
-            nn.ReLU(inplace=True),
-            nn.Linear(self.hidden_dim * 4, self.hidden_dim)
-        )
+
+        if self.if_depth_pe and not share_pe:
+            self.bev_depth_embedding = nn.Sequential(
+                nn.Linear(hidden_dim * 3 // 2, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, hidden_dim)
+            )
+        if not self.if_depth_pe:
+            self.rv_embedding = nn.Sequential(
+                nn.Linear(self.depth_num * 3, self.hidden_dim * 4),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.hidden_dim * 4, self.hidden_dim)
+            )
         # task head
         self.task_heads = nn.ModuleList()
         for num_cls in self.num_classes:
@@ -418,7 +446,7 @@ class CmtHead(BaseModule):
         pad_h, pad_w, _ = img_metas[0]['pad_shape'][0]
         coords_h = torch.arange(H, device=img_feats[0].device).float() * pad_h / H
         coords_w = torch.arange(W, device=img_feats[0].device).float() * pad_w / W
-        coords_d = 1 + torch.arange(self.depth_num, device=img_feats[0].device).float() * (self.pc_range[3] - 1) / self.depth_num
+        coords_d = self.depth_start + torch.arange(self.depth_num, device=img_feats[0].device).float() * (self.pc_range[3] - 1) / self.depth_num
         coords_h, coords_w, coords_d = torch.meshgrid([coords_h, coords_w, coords_d])
 
         coords = torch.stack([coords_w, coords_h, coords_d, coords_h.new_ones(coords_h.shape)], dim=-1)
@@ -432,7 +460,7 @@ class CmtHead(BaseModule):
         return self.rv_embedding(coords_3d.reshape(*coords_3d.shape[:-2], -1))
 
     def _bev_query_embed(self, ref_points, img_metas):
-        bev_embeds = self.bev_embedding(pos2embed(ref_points, num_pos_feats=self.hidden_dim))
+        bev_embeds = self.bev_embedding(pos2emb3d(ref_points, num_pos_feats=self.hidden_dim//2))
         return bev_embeds
 
     def _rv_query_embed(self, ref_points, img_metas):
@@ -466,11 +494,64 @@ class CmtHead(BaseModule):
         return rv_embeds
 
     def query_embed(self, ref_points, img_metas):
-        ref_points = inverse_sigmoid(ref_points.clone()).sigmoid()
+        ref_points = inverse_sigmoid(ref_points.clone())
         bev_embeds = self._bev_query_embed(ref_points, img_metas)
         rv_embeds = self._rv_query_embed(ref_points, img_metas)
         return bev_embeds, rv_embeds
 
+    def _rv_pe_depth(self, img_feats, img_metas):
+        """
+        Args:
+            img_feats: (B*N_view, C, H, W)
+            img_metas:
+            depth_map: (B*N_view, H, W)
+        Returns:
+            coords_position_embeding: (BN_view, H, W, embed_dims)
+        """
+        eps = 1e-5
+        depth_map_list = []
+        depth_map_mask_list = []
+        for meta in img_metas:
+            depth_map_list.append(torch.tensor(meta['depth_map'], device=img_feats.device, dtype=torch.float32))
+            depth_map_mask_list.append(torch.tensor(meta['depth_map_mask'],device=img_feats.device, dtype=torch.bool))
+        
+        depth_map = torch.stack(depth_map_list, dim=0)
+        depth_map_mask = torch.stack(depth_map_mask_list, dim=0)
+        depth_map[~depth_map_mask] = eps
+
+        BN, C, H, W = img_feats.shape
+        pad_h, pad_w, _ = img_metas[0]['pad_shape'][0]
+        coords_h = torch.arange(H, device=img_feats[0].device).float() * pad_h / H  # (H, )
+        coords_w = torch.arange(W, device=img_feats[0].device).float() * pad_w / W  # (W, )
+        coords_h, coords_w = torch.meshgrid([coords_h, coords_w]) # (H, W)
+
+
+        coords = torch.stack([coords_w, coords_h],dim=-1) # (H, W, 2) (u, v)
+        coords = coords.unsqueeze(0).repeat(BN, 1, 1, 1)  # (BN_view, H, W, 2)
+
+        depth_map = depth_map.reshape(-1, *depth_map.shape[2:]) # (BN_view, H, W)
+        depth_map = depth_map.unsqueeze(dim=-1)     # (B*N_view, H, W, 1)
+        coords = coords * \
+            torch.maximum(depth_map, torch.ones_like(depth_map) * eps)  # (BN_view, W, H, 2)    (du, dv)
+        coords = torch.cat([coords, depth_map], dim=-1)     # (BN_view, W, H, 3)   (du, dv, d)
+        coords = torch.cat([coords, torch.ones_like(coords[..., :1])], dim=-1)  # (BN_view, W, H, 4)   (du, dv, d, 1)
+
+        imgs2lidars = np.concatenate([np.linalg.inv(meta['lidar2img']) for meta in img_metas]) # (B*N_view, 4, 4)
+        imgs2lidars = torch.from_numpy(imgs2lidars).float().to(coords.device)
+
+       
+        coords_3d = torch.einsum('bhwc, bdc -> bhwd', coords, imgs2lidars)
+
+        coords_3d = (coords_3d[..., :3] - coords_3d.new_tensor(self.pc_range[:3])[None, None, None, :] )\
+                        / (coords_3d.new_tensor(self.pc_range[3:]) - coords_3d.new_tensor(self.pc_range[:3]))[None, None, None, :]
+        
+        coords_3d = inverse_sigmoid(coords_3d)
+        if self.share_pe:
+            return self.bev_embedding(pos2emb3d(coords_3d, num_pos_feats=self.hidden_dim//2))
+        else:
+            assert self.bev_depth_embedding is not None, "bev_depth_embedding is None"
+            return self.bev_depth_embedding(pos2emb3d(coords_3d, num_pos_feats=self.hidden_dim//2))
+       
     def forward_single(self, x, x_img, img_metas):
         """
             x: [bs c h w]
@@ -480,12 +561,42 @@ class CmtHead(BaseModule):
         x = self.shared_conv(x)
         
         reference_points = self.reference_points.weight
+
+        # import matplotlib.pyplot as plt
+        # # 提取 x 和 y 坐标
+        # x_coords = reference_points[:, 0].cpu().detach().numpy() * (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0]
+        # y_coords = reference_points[:, 1].cpu().detach().numpy() * (self.pc_range[4] - self.pc_range[1]) + self.pc_range[1]
+
+        # x_coords_gt = img_metas[0]['gt_bboxes_3d']._data.gravity_center[:, 0].cpu().detach().numpy()
+        # y_coords_gt = img_metas[0]['gt_bboxes_3d']._data.gravity_center[:, 1].cpu().detach().numpy()
+
+        # # 创建一个散点图 (scatter plot) 进行 BEV 可视化
+        # plt.figure(figsize=(10, 10))
+        # plt.scatter(x_coords, y_coords, c='blue', marker='.', alpha=0.5)
+        # plt.scatter(x_coords_gt, y_coords_gt, c='red', marker='o',alpha=0.5)
+
+        # # 设置图像标题和坐标轴标签
+        # # plt.title('Bird\'s Eye View (BEV) Visualization of Reference Point')
+        # plt.xlabel('X')
+        # plt.ylabel('Y')
+
+        # # 设置坐标轴的比例相等
+        # plt.axis('equal')
+
+        # # 显示网格
+        # plt.grid(True)
+
+        # # 保存图像为 EPS 格式
+        # plt.savefig('bev_visualization.eps', format='eps')
+
         reference_points, attn_mask, mask_dict = self.prepare_for_dn(x.shape[0], reference_points, img_metas)
         
         mask = x.new_zeros(x.shape[0], x.shape[2], x.shape[3])
-        
-        rv_pos_embeds = self._rv_pe(x_img, img_metas)
-        bev_pos_embeds = self.bev_embedding(pos2embed(self.coords_bev.to(x.device), num_pos_feats=self.hidden_dim))
+        if self.if_depth_pe:
+            rv_pos_embeds = self._rv_pe_depth(x_img, img_metas)
+        else:
+            rv_pos_embeds = self._rv_pe(x_img, img_metas)
+        bev_pos_embeds = self.bev_embedding(pos2embed(self.coords_bev.to(x.device), num_pos_feats=self.hidden_dim * 3 // 4))
         
         bev_query_embeds, rv_query_embeds = self.query_embed(reference_points, img_metas)
         query_embeds = bev_query_embeds + rv_query_embeds
@@ -924,7 +1035,12 @@ class CmtImageHead(CmtHead):
     def __init__(self, *args, **kwargs):
         super(CmtImageHead, self). __init__(*args, **kwargs)
         self.shared_conv = None
-
+    
+    def query_embed(self, ref_points, img_metas):
+        ref_points = inverse_sigmoid(ref_points.clone())
+        bev_embeds = self._bev_query_embed(ref_points, img_metas)
+        return bev_embeds, None
+    
     def forward_single(self, x, x_img, img_metas):
         """
             x: [bs c h w]
@@ -936,10 +1052,13 @@ class CmtImageHead(CmtHead):
         reference_points = self.reference_points.weight
         reference_points, attn_mask, mask_dict = self.prepare_for_dn(len(img_metas), reference_points, img_metas)
         
-        rv_pos_embeds = self._rv_pe(x_img, img_metas)
+        if self.if_depth_pe:
+            rv_pos_embeds = self._rv_pe_depth(x_img, img_metas)
+        else:
+            rv_pos_embeds = self._rv_pe(x_img, img_metas)
         
-        bev_query_embeds, rv_query_embeds = self.query_embed(reference_points, img_metas)
-        query_embeds = bev_query_embeds + rv_query_embeds
+        bev_query_embeds, _ = self.query_embed(reference_points, img_metas)
+        query_embeds = bev_query_embeds
 
         outs_dec, _ = self.transformer(
                             x_img, query_embeds,
@@ -1006,7 +1125,7 @@ class CmtLidarHead(CmtHead):
         self.rv_embedding = None
 
     def query_embed(self, ref_points, img_metas):
-        ref_points = inverse_sigmoid(ref_points.clone()).sigmoid()
+        ref_points = inverse_sigmoid(ref_points.clone())
         bev_embeds = self._bev_query_embed(ref_points, img_metas)
         return bev_embeds, None
     
@@ -1025,7 +1144,7 @@ class CmtLidarHead(CmtHead):
         
         mask = x.new_zeros(x.shape[0], x.shape[2], x.shape[3])
         
-        bev_pos_embeds = self.bev_embedding(pos2embed(self.coords_bev.to(x.device), num_pos_feats=self.hidden_dim))
+        bev_pos_embeds = self.bev_embedding(pos2embed(self.coords_bev.to(x.device), num_pos_feats=self.hidden_dim *3 // 4))
         bev_query_embeds, _ = self.query_embed(reference_points, img_metas)
 
         query_embeds = bev_query_embeds
