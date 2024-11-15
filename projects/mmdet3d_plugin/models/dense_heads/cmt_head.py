@@ -234,6 +234,7 @@ class CmtHead(BaseModule):
                  noise_trans=0.0,
                  dn_weight=1.0,
                  split=0.75,
+                 position_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
                  train_cfg=None,
                  test_cfg=None,
                  common_heads=dict(
@@ -294,6 +295,7 @@ class CmtHead(BaseModule):
         self.loss_heatmap = build_loss(loss_heatmap)
         self.bbox_coder = build_bbox_coder(bbox_coder)
         self.pc_range = self.bbox_coder.pc_range
+        self.position_range = position_range
         self.fp16_enabled = False
            
         self.shared_conv = ConvModule(
@@ -446,7 +448,7 @@ class CmtHead(BaseModule):
         pad_h, pad_w, _ = img_metas[0]['pad_shape'][0]
         coords_h = torch.arange(H, device=img_feats[0].device).float() * pad_h / H
         coords_w = torch.arange(W, device=img_feats[0].device).float() * pad_w / W
-        coords_d = self.depth_start + torch.arange(self.depth_num, device=img_feats[0].device).float() * (self.pc_range[3] - 1) / self.depth_num
+        coords_d = self.depth_start + torch.arange(self.depth_num, device=img_feats[0].device).float() * (self.position_range[3] - 1) / self.depth_num
         coords_h, coords_w, coords_d = torch.meshgrid([coords_h, coords_w, coords_d])
 
         coords = torch.stack([coords_w, coords_h, coords_d, coords_h.new_ones(coords_h.shape)], dim=-1)
@@ -455,8 +457,8 @@ class CmtHead(BaseModule):
         imgs2lidars = np.concatenate([np.linalg.inv(meta['lidar2img']) for meta in img_metas])
         imgs2lidars = torch.from_numpy(imgs2lidars).float().to(coords.device)
         coords_3d = torch.einsum('hwdo, bco -> bhwdc', coords, imgs2lidars)
-        coords_3d = (coords_3d[..., :3] - coords_3d.new_tensor(self.pc_range[:3])[None, None, None, :] )\
-                        / (coords_3d.new_tensor(self.pc_range[3:]) - coords_3d.new_tensor(self.pc_range[:3]))[None, None, None, :]
+        coords_3d = (coords_3d[..., :3] - coords_3d.new_tensor(self.position_range[:3])[None, None, None, :] )\
+                        / (coords_3d.new_tensor(self.position_range[3:]) - coords_3d.new_tensor(self.position_range[:3]))[None, None, None, :]
         return self.rv_embedding(coords_3d.reshape(*coords_3d.shape[:-2], -1))
 
     def _bev_query_embed(self, ref_points, img_metas):
@@ -470,7 +472,7 @@ class CmtHead(BaseModule):
         imgs2lidars = np.stack([np.linalg.inv(meta['lidar2img']) for meta in img_metas])
         imgs2lidars = torch.from_numpy(imgs2lidars).float().to(ref_points.device)
 
-        ref_points = ref_points * (ref_points.new_tensor(self.pc_range[3:]) - ref_points.new_tensor(self.pc_range[:3])) + ref_points.new_tensor(self.pc_range[:3])
+        ref_points = ref_points * (ref_points.new_tensor(self.position_range[3:]) - ref_points.new_tensor(self.position_range[:3])) + ref_points.new_tensor(self.pc_range[:3])
         proj_points = torch.einsum('bnd, bvcd -> bvnc', torch.cat([ref_points, ref_points.new_ones(*ref_points.shape[:-1], 1)], dim=-1), lidars2imgs)
         
         proj_points_clone = proj_points.clone()
@@ -481,13 +483,13 @@ class CmtHead(BaseModule):
         mask = (proj_points_clone[..., 0] < pad_w) & (proj_points_clone[..., 0] >= 0) & (proj_points_clone[..., 1] < pad_h) & (proj_points_clone[..., 1] >= 0)
         mask &= z_mask.squeeze(-1)
 
-        coords_d = 1 + torch.arange(self.depth_num, device=ref_points.device).float() * (self.pc_range[3] - 1) / self.depth_num
+        coords_d = 1 + torch.arange(self.depth_num, device=ref_points.device).float() * (self.position_range[3] - 1) / self.depth_num
         proj_points_clone = torch.einsum('bvnc, d -> bvndc', proj_points_clone, coords_d)
         proj_points_clone = torch.cat([proj_points_clone[..., :3], proj_points_clone.new_ones(*proj_points_clone.shape[:-1], 1)], dim=-1)
         projback_points = torch.einsum('bvndo, bvco -> bvndc', proj_points_clone, imgs2lidars)
 
-        projback_points = (projback_points[..., :3] - projback_points.new_tensor(self.pc_range[:3])[None, None, None, :] )\
-                        / (projback_points.new_tensor(self.pc_range[3:]) - projback_points.new_tensor(self.pc_range[:3]))[None, None, None, :]
+        projback_points = (projback_points[..., :3] - projback_points.new_tensor(self.position_range[:3])[None, None, None, :] )\
+                        / (projback_points.new_tensor(self.position_range[3:]) - projback_points.new_tensor(self.position_range[:3]))[None, None, None, :]
         
         rv_embeds = self.rv_embedding(projback_points.reshape(*projback_points.shape[:-2], -1))
         rv_embeds = (rv_embeds * mask.unsqueeze(-1)).sum(dim=1)
@@ -510,14 +512,14 @@ class CmtHead(BaseModule):
         """
         eps = 1e-5
         depth_map_list = []
-        depth_map_mask_list = []
+        # depth_map_mask_list = []
         for meta in img_metas:
             depth_map_list.append(torch.tensor(meta['depth_map'], device=img_feats.device, dtype=torch.float32))
-            depth_map_mask_list.append(torch.tensor(meta['depth_map_mask'],device=img_feats.device, dtype=torch.bool))
+            # depth_map_mask_list.append(torch.tensor(meta['depth_map_mask'],device=img_feats.device, dtype=torch.bool))
         
         depth_map = torch.stack(depth_map_list, dim=0)
-        depth_map_mask = torch.stack(depth_map_mask_list, dim=0)
-        depth_map[~depth_map_mask] = eps
+        # depth_map_mask = torch.stack(depth_map_mask_list, dim=0)
+        # depth_map[~depth_map_mask] = eps
 
         BN, C, H, W = img_feats.shape
         pad_h, pad_w, _ = img_metas[0]['pad_shape'][0]
@@ -542,8 +544,8 @@ class CmtHead(BaseModule):
        
         coords_3d = torch.einsum('bhwc, bdc -> bhwd', coords, imgs2lidars)
 
-        coords_3d = (coords_3d[..., :3] - coords_3d.new_tensor(self.pc_range[:3])[None, None, None, :] )\
-                        / (coords_3d.new_tensor(self.pc_range[3:]) - coords_3d.new_tensor(self.pc_range[:3]))[None, None, None, :]
+        coords_3d = (coords_3d[..., :3] - coords_3d.new_tensor(self.position_range[:3])[None, None, None, :] )\
+                        / (coords_3d.new_tensor(self.position_range[3:]) - coords_3d.new_tensor(self.position_range[:3]))[None, None, None, :]
         
         coords_3d = inverse_sigmoid(coords_3d)
         if self.share_pe:
