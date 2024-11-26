@@ -5,4 +5,6 @@ from .cmt_head import (
     CmtLidarHead
 )
 
-__all__ = ['SeparateTaskHead', 'CmtHead', 'CmtLidarHead', 'CmtImageHead']
+from .petr_head import PETRHead
+
+__all__ = ['SeparateTaskHead', 'CmtHead', 'CmtLidarHead', 'CmtImageHead', "PETRHead"]
