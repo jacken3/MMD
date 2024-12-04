@@ -1,10 +1,4 @@
-from .cmt_head import (
-    SeparateTaskHead,
-    CmtHead,
-    CmtImageHead,
-    CmtLidarHead
-)
-
+from .cmt_head import CmtHead
 from .petr_head import PETRHead
 
-__all__ = ['SeparateTaskHead', 'CmtHead', 'CmtLidarHead', 'CmtImageHead', "PETRHead"]
+__all__ = ['CmtHead', "PETRHead"]

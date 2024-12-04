@@ -81,7 +81,7 @@ class CmtTransformer(BaseModule):
                 xavier_init(m, distribution='uniform')
         self._is_init = True
 
-    def forward(self, x, x_img, query_embed, bev_pos_embed, rv_pos_embed, attn_masks=None, reg_branch=None):
+    def forward(self, x, x_img, query_embed, bev_pos_embed, rv_pos_embed, attn_masks=None, reg_branch=None, bs=1):
         """Forward function for `Transformer`.
         Args:
             x (Tensor): Input query with shape [bs, c, h, w] where
@@ -101,18 +101,39 @@ class CmtTransformer(BaseModule):
                 - memory: Output results from encoder, with shape \
                       [bs, embed_dims, h, w].
         """
-        bs, c, h, w = x.shape
-        bev_memory = rearrange(x, "bs c h w -> (h w) bs c") # [bs, n, c, h, w] -> [n*h*w, bs, c]
-        rv_memory = rearrange(x_img, "(bs v) c h w -> (v h w) bs c", bs=bs)
-        bev_pos_embed = bev_pos_embed.unsqueeze(1).repeat(1, bs, 1) # [bs, n, c, h, w] -> [n*h*w, bs, c]
-        rv_pos_embed = rearrange(rv_pos_embed, "(bs v) h w c -> (v h w) bs c", bs=bs)
+        # If both x and x_img are None, raise an error or handle accordingly
+        if x is None and x_img is None:
+            raise ValueError("Both 'x' and 'x_img' are None. At least one of them should be provided.")
         
-        memory, pos_embed = torch.cat([bev_memory, rv_memory], dim=0), torch.cat([bev_pos_embed, rv_pos_embed], dim=0)
-        query_embed = query_embed.transpose(0, 1)  # [num_query, dim] -> [num_query, bs, dim]
-        mask =  memory.new_zeros(bs, memory.shape[0]) # [bs, n, h, w] -> [bs, n*h*w]
+        # If only x is provided (single modality)
+        if x is not None:
+            bev_memory = rearrange(x, "bs c h w -> (h w) bs c")  # [bs, c, h, w] -> [n*h*w, bs, c]
+            bev_pos_embed = bev_pos_embed.unsqueeze(1).repeat(1, bs, 1) if bev_pos_embed is not None else None
+            memory = bev_memory
+            pos_embed = bev_pos_embed
+        else:
+            bev_memory = None
+            memory = None
+            pos_embed = None
 
+        # If x_img is provided (second modality)
+        if x_img is not None:
+            rv_memory = rearrange(x_img, "(bs v) c h w -> (v h w) bs c", bs=bs)  # [bs, v, c, h, w] -> [v*h*w, bs, c]
+            rv_pos_embed = rearrange(rv_pos_embed, "(bs v) h w c -> (v h w) bs c", bs=bs) if rv_pos_embed is not None else None
+            memory = rv_memory if memory is None else torch.cat([memory, rv_memory], dim=0)
+            pos_embed = rv_pos_embed if pos_embed is None else torch.cat([pos_embed, rv_pos_embed], dim=0)
+
+        # Ensure `query_embed` is available
+        if query_embed is None:
+            raise ValueError("'query_embed' must be provided.")
+        
+        query_embed = query_embed.transpose(0, 1)  # [num_query, dim] -> [num_query, bs, dim]
+        
+        # Create padding mask: [bs, n*h*w]
+        mask = memory.new_zeros(bs, memory.shape[0]) if memory is not None else None
         target = torch.zeros_like(query_embed)
-        # out_dec: [num_layers, num_query, bs, dim]
+        
+        # Decoder pass
         out_dec = self.decoder(
             query=target,
             key=memory,
@@ -122,9 +143,10 @@ class CmtTransformer(BaseModule):
             key_padding_mask=mask,
             attn_masks=[attn_masks, None],
             reg_branch=reg_branch,
-            )
+        )
+        
         out_dec = out_dec.transpose(1, 2)
-        return  out_dec, memory
+        return out_dec, memory
 
 
 @TRANSFORMER.register_module()
