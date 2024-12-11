@@ -81,6 +81,7 @@ class CmtHead(BaseModule):
                  bg_cls_weight = 0,
                  if_depth_pe=False,
                  share_pe=False,
+                 query_3dpe=True,
                  depth_start=1,
                  downsample_scale=8,
                  scalar=10,
@@ -135,6 +136,7 @@ class CmtHead(BaseModule):
         self.depth_num = depth_num
         self.LID = LID
         self.with_multiview = with_multiview
+        self.query_3dpe = query_3dpe
         self.positional_encoding = positional_encoding #for multiview pe
 
         self.downsample_scale = downsample_scale #
@@ -185,12 +187,12 @@ class CmtHead(BaseModule):
         self.transformer = build_transformer(transformer)
         self.reference_points = nn.Embedding(num_query, 3)
         
-
-        self.bev_3d_embedding = nn.Sequential(
-            nn.Linear(hidden_dim * 3 // 2, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim)
-        ) # 用于对BEV位置信息进行编码(主要对3D的参考点进行位置编码，当share_pe时，也用于编码图像特征点)
+        if self.query_3dpe:
+            self.bev_3d_embedding = nn.Sequential(
+                nn.Linear(hidden_dim * 3 // 2, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, hidden_dim)
+            ) # 用于对BEV位置信息进行编码(主要对3D的参考点进行位置编码，当share_pe时，也用于编码图像特征点)
 
         if input_modality['use_camera']: 
             self.input_proj = Conv2d(
@@ -378,7 +380,10 @@ class CmtHead(BaseModule):
 
     def query_embed(self, ref_points, img_metas):
         ref_points = inverse_sigmoid(ref_points.clone())
-        query_embeds = self.bev_3d_embedding(pos2emb3d(ref_points))
+        if self.query_3dpe:
+            query_embeds = self.bev_3d_embedding(pos2emb3d(ref_points))
+        else:
+            query_embeds = self.bev_2d_embedding(pos2embed(ref_points, num_pos_feats=self.hidden_dim))
         return query_embeds
 
     def _rv_pe_depth(self, img_feats, img_metas):

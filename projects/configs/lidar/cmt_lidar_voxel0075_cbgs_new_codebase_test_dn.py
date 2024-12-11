@@ -134,8 +134,8 @@ data = dict(
             ann_file=data_root + '/nuscenes_infos_train.pkl',
             load_interval=1,
             pipeline=train_pipeline,
-            classes=class_names,
             ft_begin_epoch=15,
+            classes=class_names,
             modality=input_modality,
             test_mode=False,
             box_type_3d='LiDAR')),
@@ -197,30 +197,26 @@ model = dict(
         upsample_cfg=dict(type='deconv', bias=False),
         use_conv_for_no_stride=True),
     pts_bbox_head=dict(
-        type='CmtLidarHead',
-        in_channels=512,
+        type='CmtHead',
+        input_modality=dict(
+                    use_lidar=True,
+                    use_camera=False,
+                 ),
+        num_classes=10,
+        with_dn=True,
+        pts_in_channels=512,
         hidden_dim=256,
+        bg_cls_weight=0, #背景类的权重
         downsample_scale=8,
-        common_heads=dict(center=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2)),
-        tasks=[
-            dict(num_class=10, class_names=[
-                'car', 'truck', 'construction_vehicle',
-                'bus', 'trailer', 'barrier',
-                'motorcycle', 'bicycle',
-                'pedestrian', 'traffic_cone'
-            ]),
-        ],
         bbox_coder=dict(
-            type='MultiTaskBBoxCoder',
+            type='NMSFreeCoder',
             post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
             pc_range=point_cloud_range,
             max_num=300,
             voxel_size=voxel_size,
-            num_classes=10), 
-        separate_head=dict(
-            type='SeparateTaskHead', init_bias=-2.19, final_kernel=3),
+            num_classes=10),  
         transformer=dict(
-            type='CmtLidarTransformer',
+            type='CmtTransformer',
             decoder=dict(
                 type='PETRTransformerDecoder',
                 return_intermediate=True,
@@ -239,16 +235,8 @@ model = dict(
                             num_heads=8,
                             dropout=0.1),
                         ],
-                    ffn_cfgs=dict(
-                        type='FFN',
-                        embed_dims=256,
-                        feedforward_channels=1024,
-                        num_fcs=2,
-                        ffn_drop=0.,
-                        act_cfg=dict(type='ReLU', inplace=True),
-                    ),
-
-                    feedforward_channels=1024, #unused
+                    feedforward_channels=2048,
+                    ffn_dropout=0.1,
                     operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
                                      'ffn', 'norm')),
             )),
@@ -265,7 +253,6 @@ model = dict(
                 reg_cost=dict(type='BBox3DL1Cost', weight=0.25),
                 iou_cost=dict(type='IoUCost', weight=0.0), # Fake cost. This is just to make it compatible with DETR head. 
                 pc_range=point_cloud_range,
-                code_weights=[2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2],
             ),
             pos_weight=-1,
             gaussian_overlap=0.1,
@@ -273,7 +260,7 @@ model = dict(
             grid_size=[1440, 1440, 40],  # [x_len, y_len, 1]
             voxel_size=voxel_size,
             out_size_factor=out_size_factor,
-            code_weights=[2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2],
+            code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2],
             point_cloud_range=point_cloud_range)),
     test_cfg=dict(
         pts=dict(
@@ -317,3 +304,4 @@ resume_from = None
 workflow = [('train', 1)]
 gpu_ids = range(0, 8)
 custom_hooks = [dict(type='CustomSetEpochInfoHook')]
+

@@ -125,7 +125,7 @@ test_pipeline = [
 ]
 data = dict(
     samples_per_gpu=2,
-    workers_per_gpu=4,
+    workers_per_gpu=0,
     train=dict(
         type='CBGSDataset',
         dataset=dict(
@@ -134,6 +134,7 @@ data = dict(
             ann_file=data_root + '/nuscenes_infos_train.pkl',
             load_interval=1,
             pipeline=train_pipeline,
+            ft_begin_epoch=15,
             classes=class_names,
             modality=input_modality,
             test_mode=False,
@@ -290,4 +291,5 @@ load_from = None
 resume_from = None
 workflow = [('train', 1)]
 gpu_ids = range(0, 8)
+custom_hooks = [dict(type='CustomSetEpochInfoHook')]
 

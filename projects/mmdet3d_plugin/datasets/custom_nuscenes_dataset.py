@@ -16,6 +16,7 @@ import pandas as pd
 from refile import smart_open
 from prettytable import PrettyTable
 import json
+from .pipelines.customCompose import CustomCompose
 
 import mmcv
 
@@ -27,9 +28,14 @@ class CustomNuScenesDataset(NuScenesDataset):
     This datset only add camera intrinsics and extrinsics to the results.
     """
 
-    def __init__(self, *args, return_gt_info=False, **kwargs):
+    def __init__(self, *args, return_gt_info=False, ft_begin_epoch=None, **kwargs):
         super(CustomNuScenesDataset, self).__init__(*args, **kwargs)
         self.return_gt_info = return_gt_info
+        self.pipeline = CustomCompose(kwargs['pipeline'], ft_begin_epoch)
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+        self.pipeline.__setattr__('epoch', epoch)
 
     def get_data_info(self, index):
         """Get data info according to the given index.
