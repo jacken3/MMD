@@ -16,6 +16,7 @@ import pandas as pd
 from refile import smart_open
 from prettytable import PrettyTable
 import json
+from mmdet.datasets.api_wrappers import COCO
 from .pipelines.customCompose import CustomCompose
 
 import mmcv
@@ -28,9 +29,13 @@ class CustomNuScenesDataset(NuScenesDataset):
     This datset only add camera intrinsics and extrinsics to the results.
     """
 
-    def __init__(self, *args, return_gt_info=False, ft_begin_epoch=None, **kwargs):
+    def __init__(self, *args, ann_file_2d=None, return_gt_info=False, ft_begin_epoch=None, return_2d_annos=False, **kwargs):
         super(CustomNuScenesDataset, self).__init__(*args, **kwargs)
         self.return_gt_info = return_gt_info
+        self.return_2d_annos = return_2d_annos
+        if self.return_2d_annos:
+            assert ann_file_2d is not None
+            self.load_annotations_2d(ann_file_2d)
         self.pipeline = CustomCompose(kwargs['pipeline'], ft_begin_epoch)
 
     def set_epoch(self, epoch):
@@ -106,10 +111,142 @@ class CustomNuScenesDataset(NuScenesDataset):
 
         if not self.test_mode:
             annos = self.get_ann_info(index)
-            input_dict['ann_info'] = annos
+            input_dict['ann_info'] = annos # 在这里的gt_bbox_3d的所有值都是正确的，只不过LidarInstance3DBoxes的dim在类中被认为是wlh,但实际是lwh
 
+            if self.return_2d_annos:
+                gt_bboxes_3d = annos['gt_bboxes_3d']  # 3d bboxes
+                gt_labels_3d = annos['gt_labels_3d']
+                gt_bboxes_2d = []  # per-view 2d bboxes
+                gt_bboxes_ignore = []  # per-view 2d bboxes
+                gt_bboxes_2d_to_3d = []  # mapping from per-view 2d bboxes to 3d bboxes
+                gt_labels_2d = []  # mapping from per-view 2d bboxes to 3d bboxes
+
+                for cam_i in range(len(image_paths)):
+                    ann_2d = self.impath_to_ann2d(image_paths[cam_i])
+                    labels_2d = ann_2d['labels']
+                    bboxes_2d = ann_2d['bboxes_2d']
+                    bboxes_ignore = ann_2d['gt_bboxes_ignore']
+                    bboxes_cam = ann_2d['bboxes_cam']
+                    lidar2cam = lidar2cam_rts[cam_i]
+
+                    centers_lidar = gt_bboxes_3d.gravity_center.numpy()
+                    centers_lidar_hom = np.concatenate([centers_lidar, np.ones((len(centers_lidar), 1))], axis=1)
+                    centers_cam = (centers_lidar_hom @ lidar2cam.T)[:, :3]
+                    match = self.center_match(bboxes_cam, centers_cam)
+                    assert (labels_2d[match > -1] == gt_labels_3d[match[match > -1]]).all()
+
+                    gt_bboxes_2d.append(bboxes_2d)
+                    gt_bboxes_2d_to_3d.append(match)
+                    gt_labels_2d.append(labels_2d)
+                    gt_bboxes_ignore.append(bboxes_ignore)
+
+                annos['gt_bboxes_2d'] = gt_bboxes_2d
+                annos['gt_labels_2d'] = gt_labels_2d
+                annos['gt_bboxes_2d_to_3d'] = gt_bboxes_2d_to_3d
+                annos['gt_bboxes_ignore'] = gt_bboxes_ignore
+                
         return input_dict
+    
+    def center_match(self, bboxes_a, bboxes_b):
+        cts_a, cts_b = bboxes_a[:, :3], bboxes_b[:, :3]
+        if len(cts_a) == 0:
+            return np.zeros(len(cts_a), dtype=np.int32) - 1
+        if len(cts_b) == 0:
+            return np.zeros(len(cts_a), dtype=np.int32) - 1
+        dist = np.abs(cts_a[:, None] - cts_b[None]).sum(-1)
+        match = dist.argmin(1)
+        match[dist.min(1) > 1e-3] = -1
+        return match
 
+    def load_annotations_2d(self, ann_file):
+        self.coco = COCO(ann_file)
+        self.cat_ids = self.coco.get_cat_ids(cat_names=self.CLASSES)
+        self.cat2label = {cat_id: i for i, cat_id in enumerate(self.cat_ids)}
+        self.impath_to_imgid = {}
+        self.imgid_to_dataid = {}
+        data_infos = []
+        total_ann_ids = []
+        for i in self.coco.get_img_ids():
+            info = self.coco.load_imgs([i])[0]
+            info['filename'] = info['file_name']
+            self.impath_to_imgid['./data/nuscenes/' + info['file_name']] = i
+            self.imgid_to_dataid[i] = len(data_infos)
+            data_infos.append(info)
+            ann_ids = self.coco.get_ann_ids(img_ids=[i])
+            total_ann_ids.extend(ann_ids)
+        assert len(set(total_ann_ids)) == len(
+            total_ann_ids), f"Annotation ids in '{ann_file}' are not unique!"
+        self.data_infos_2d = data_infos
+
+    def impath_to_ann2d(self, impath):
+        img_id = self.impath_to_imgid[impath]
+        data_id = self.imgid_to_dataid[img_id]
+        ann_ids = self.coco.get_ann_ids(img_ids=[img_id])
+        ann_info = self.coco.load_anns(ann_ids)
+        return self.get_ann_info_2d(self.data_infos_2d[data_id], ann_info)
+    
+    def get_ann_info_2d(self, img_info_2d, ann_info_2d):
+        """Parse bbox annotation.
+
+        Args:
+            img_info (list[dict]): Image info.
+            ann_info (list[dict]): Annotation info of an image.
+
+        Returns:
+            dict: A dict containing the following keys: bboxes, labels,
+                gt_bboxes_3d, gt_labels_3d, attr_labels, centers2d,
+                depths, bboxes_ignore, masks, seg_map
+        """
+        gt_bboxes = []
+        gt_labels = []
+        gt_bboxes_ignore = []
+        gt_bboxes_cam3d = []
+        for i, ann in enumerate(ann_info_2d):
+            if ann.get('ignore', False):
+                continue
+            x1, y1, w, h = ann['bbox']
+            inter_w = max(0, min(x1 + w, img_info_2d['width']) - max(x1, 0))
+            inter_h = max(0, min(y1 + h, img_info_2d['height']) - max(y1, 0))
+            if inter_w * inter_h == 0:
+                continue
+            if ann['area'] <= 0 or w < 1 or h < 1:
+                continue
+            if ann['category_name'] not in self.CLASSES:
+                continue
+            bbox = [x1, y1, x1 + w, y1 + h]
+            if ann.get('iscrowd', False):
+                gt_bboxes_ignore.append(bbox)
+            else:
+                gt_bboxes.append(bbox)
+                gt_labels.append(self.CLASSES.index(ann['category_name']))
+                bbox_cam3d = np.array(ann['bbox_cam3d']).reshape(1, -1)
+                bbox_cam3d = np.concatenate([bbox_cam3d], axis=-1)
+                gt_bboxes_cam3d.append(bbox_cam3d.squeeze())
+
+        if gt_bboxes:
+            gt_bboxes = np.array(gt_bboxes, dtype=np.float32)
+            gt_labels = np.array(gt_labels, dtype=np.int64)
+        else:
+            gt_bboxes = np.zeros((0, 4), dtype=np.float32)
+            gt_labels = np.array([], dtype=np.int64)
+
+        if gt_bboxes_cam3d:
+            gt_bboxes_cam3d = np.array(gt_bboxes_cam3d, dtype=np.float32)
+        else:
+            gt_bboxes_cam3d = np.zeros((0, 6), dtype=np.float32)
+
+        if gt_bboxes_ignore:
+            gt_bboxes_ignore = np.array(gt_bboxes_ignore, dtype=np.float32)
+        else:
+            gt_bboxes_ignore = np.zeros((0, 4), dtype=np.float32)
+
+        ann = dict(
+            bboxes_cam=gt_bboxes_cam3d,
+            bboxes_2d=gt_bboxes,
+            gt_bboxes_ignore=gt_bboxes_ignore,
+            labels=gt_labels, )
+        return ann
+    
     def _evaluate_single(self,
                          result_path,
                          logger=None,

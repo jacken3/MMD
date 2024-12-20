@@ -6,5 +6,6 @@ from .cmt_head_origin import (
     CmtImageHead,
     CmtLidarHead
 )
+from .ICFusion_head import ICFusionHead
 
-__all__ = ['CmtHead', "PETRHead", "CmtHeadO", "CmtImageHead", "CmtLidarHead", "SeparateTaskHead"]
+__all__ = ['CmtHead', "PETRHead", "CmtHeadO", "CmtImageHead", "CmtLidarHead", "SeparateTaskHead", "ICFusionHead"]
