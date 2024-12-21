@@ -44,11 +44,11 @@ model = dict(
         out_channels=256,
         num_outs=5),
     extra_neck=dict(
-        type='FPN',
+        type='CPFPN',
         in_channels=[256, 256, 256, 256, 256],
         out_channels=256,
         start_level=2,
-        end_level=3,
+        end_level=4,
         num_outs=2),
     bbox_head_2d=dict(
         type='Prior2D',
@@ -288,7 +288,7 @@ test_pipeline = [
                         'img_norm_cfg', 'pcd_trans', 'sample_idx',
                         'pcd_scale_factor', 'pcd_rotation', 'pts_filename',
                         'transformation_3d_flow', 'rot_degree',
-                        'gt_bboxes_3d', 'gt_labels_3d', 'depth_map', 'depth_map_mask'),)
+                        'gt_bboxes_3d', 'gt_labels_3d', 'depth_map', 'depth_map_mask', 'cam_intrinsic', 'lidar2cam'),)
         ])
 ]
 

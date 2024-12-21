@@ -328,9 +328,15 @@ class ICFusionDetector(MVXTwoStageDetector):
             proposals = self.detector_2d.forward_test(img_feats, img_metas)
             proposals = self.detector_2d.process_prosals(proposals, img.device)
         else:
-            proposals = None   
-        result_dict['img_bbox'] = proposals   
+            proposals = None
+        # for i in range(len(bbox_list)):
+        #     bbox_list[i]['img_bbox'] = proposals[i]
         if (pts_feats or img_feats) and self.with_pts_bbox:
+            if self.if_2d_prior:
+                if self.extra_fpn:
+                    img_feats = self.extra_neck(img_feats)
+                else:
+                    img_feats = img_feats[-3:]    
             bbox_pts = self.simple_test_pts(
                 pts_feats, img_feats, img_metas, proposals, rescale=rescale)
             for result_dict, pts_bbox in zip(bbox_list, bbox_pts):

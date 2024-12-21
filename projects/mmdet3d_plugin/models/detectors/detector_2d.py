@@ -78,8 +78,9 @@ class Prior2D(TwoStageDetector):
                                                  gt_bboxes, gt_labels,
                                                  gt_bboxes_ignore, gt_masks,
                                                  **kwargs)
-        losses.update(roi_losses)
-
+        for key, value in roi_losses.items():
+            losses[key+'_roi'] = value
+            
         return losses, proposal_list
 
     def set_detection_cfg(self, detection_cfg):

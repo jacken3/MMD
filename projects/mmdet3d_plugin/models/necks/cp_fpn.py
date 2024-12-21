@@ -117,7 +117,7 @@ class CPFPN(BaseModule):
                 act_cfg=act_cfg,
                 inplace=False)
             self.lateral_convs.append(l_conv)
-            if i == 0 :
+            if i == self.start_level :
                 fpn_conv = ConvModule(
                     out_channels,
                     out_channels,
