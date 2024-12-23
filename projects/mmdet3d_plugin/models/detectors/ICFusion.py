@@ -11,6 +11,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from mmcv.parallel import DataContainer as DC
+from os import path as osp
 
 from mmcv.runner import force_fp32, auto_fp16
 from mmdet.core import multi_apply
@@ -274,6 +276,96 @@ class ICFusionDetector(MVXTwoStageDetector):
         losses = self.pts_bbox_head.loss(*loss_inputs)
         return losses
 
+    def visualize_attention_maps(self,attn_weights2visual, img, alpha=0.5, save_dir='./visual'):
+        import cv2
+        import matplotlib.pyplot as plt
+        import os
+        from PIL import Image
+
+        def denormalize(img, img_norm_config):
+            img = img.permute(1, 2, 0).cpu().numpy().astype(np.float64)
+            img = mmcv.imdenormalize(img, img_norm_config['mean'], img_norm_config['std'], img_norm_config['to_rgb'])
+            return img
+        """
+        可视化从 attn_weights2visual 得到的注意力图，并叠加到对应相机图像上。
+
+        Args:
+            attn_weights2visual (torch.Tensor): 形状 [Q, N, H, W]
+                - Q: Query 数
+                - N: 相机数（环视图数）
+                - H, W: 特征图尺寸
+            img (torch.Tensor): 形状 [N, 3, H_img, W_img]
+                - N: 相机数
+                - 3: 通道数 (RGB)
+                - H_img, W_img: 原图(或网络输入尺寸)的高宽
+            alpha (float): 叠加热力图时的透明度系数 (0~1)
+        """
+        img = img.detach()
+        Q, N, H_feat, W_feat = attn_weights2visual.shape
+        # img.shape = [N, 3, H_img, W_img]
+        _, C, H_img, W_img = img.shape
+
+        for q_idx in range(Q):
+            attn_map_q = attn_weights2visual[q_idx]  
+            global_min = attn_map_q.min()
+            global_max = attn_map_q.max()
+
+            denom = (global_max - global_min).clamp_min(1e-7)
+
+            attn_map_q_norm = (attn_map_q - global_min) / denom
+            for cam_idx in range(N):
+                attn_map_2d = attn_map_q_norm[cam_idx].numpy()  
+
+                attn_map_2d = cv2.resize(
+                    attn_map_2d, (W_img, H_img), interpolation=cv2.INTER_CUBIC
+                )
+
+                img_cam = img[cam_idx]
+                img_cam_np = denormalize(img_cam, dict(mean=np.array([103.53, 116.28, 123.675]), std=np.array([57.375, 57.12, 58.395]), to_rgb=False))
+                img_cam_np = img_cam_np[:,:,[2,1,0]]
+        
+                # 如果图像是 0~1 浮点，则需要转到 0~255
+                if img_cam_np.max() <= 1.0:
+                    img_cam_np = (img_cam_np * 255).clip(0, 255).astype(np.uint8)
+                else:
+                    img_cam_np = img_cam_np.astype(np.uint8)
+
+                heatmap = (attn_map_2d * 255).astype(np.uint8)  # [0,1] -> [0,255]
+                mask_transparent = (heatmap < 50)
+
+                heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)  # BGR
+                heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)      # -> RGB
+                colored_hm_rgba = np.dstack([heatmap, np.full((H_img,W_img), 255, dtype=np.uint8)])
+                
+                colored_hm_rgba[mask_transparent, 3] = 0  # alpha=0
+                colored_hm_rgba[~mask_transparent, 3] = int(255 * alpha)  # alpha=0.5
+
+
+                bg_rgba = Image.fromarray(img_cam_np, mode='RGB').convert('RGBA')  # (H×W×4)
+                fg_rgba = Image.fromarray(colored_hm_rgba, mode='RGBA')
+                out_pil = Image.alpha_composite(bg_rgba, fg_rgba)  # 叠加
+                overlay = out_pil.convert('RGB')                  # 转回 RGB (H×W×3)
+
+                # 转回 numpy array (uint8, 0~255)
+                overlay = np.array(overlay, dtype=np.uint8)
+
+                plt.figure(figsize=(10, 5))
+                plt.suptitle(f"Query {q_idx}, Camera {cam_idx} (Unified Norm)", fontsize=14)
+
+                plt.subplot(1, 2, 1)
+                plt.imshow(img_cam_np)
+                plt.title("Original Image")
+                plt.axis("off")
+
+                plt.subplot(1, 2, 2)
+                plt.imshow(overlay)
+                plt.title("Attn Overlay")
+                plt.axis("off")
+
+                save_path = os.path.join(save_dir, f"query_{q_idx}_cam_{cam_idx}.png")
+                plt.savefig(save_path, bbox_inches='tight')
+                plt.close()  # 关闭图窗，防止内存占用过多
+
     def forward_test(self,
                      points=None,
                      img_metas=None,
@@ -300,19 +392,27 @@ class ICFusionDetector(MVXTwoStageDetector):
                 raise TypeError('{} must be a list, but got {}'.format(
                     name, type(var)))
 
-        return self.simple_test(points[0], img_metas[0], img[0], **kwargs)
+        result, bbox_index, attn_weights = self.simple_test(points[0], img_metas[0], img[0], **kwargs)
+        if False:
+            bbox_index = [index.cpu().numpy() for index in bbox_index]
+            attn_weights = [attn.cpu() for attn in attn_weights]
+
+            attn_weights2visual = attn_weights[3][0][bbox_index[0][torch.where(result[0]['pts_bbox']['scores_3d'] > 0.4)[0]]].reshape(-1,6,20,50)
+            self.visualize_attention_maps(attn_weights2visual, img[0], alpha=0.5)
+    
+        return result
     
     @force_fp32(apply_to=('x', 'x_img'))
     def simple_test_pts(self, x, x_img, img_metas, proposals=None, rescale=False):
         """Test function of point cloud branch."""
         outs = self.pts_bbox_head(x, x_img, img_metas, proposals)
-        bbox_list = self.pts_bbox_head.get_bboxes(
+        bbox_list, bbox_index = self.pts_bbox_head.get_bboxes(
             outs, img_metas, rescale=rescale)
         bbox_results = [
             bbox3d2result(bboxes, scores, labels)
             for bboxes, scores, labels in bbox_list
         ] 
-        return bbox_results
+        return bbox_results, bbox_index, outs['attn_weights']
 
     def simple_test(self, points, img_metas, img=None, rescale=False):
         img_feats, pts_feats = self.extract_feat(
@@ -337,7 +437,7 @@ class ICFusionDetector(MVXTwoStageDetector):
                     img_feats = self.extra_neck(img_feats)
                 else:
                     img_feats = img_feats[-3:]    
-            bbox_pts = self.simple_test_pts(
+            bbox_pts, bbox_index, attn_weights = self.simple_test_pts(
                 pts_feats, img_feats, img_metas, proposals, rescale=rescale)
             for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
                 result_dict['pts_bbox'] = pts_bbox
@@ -346,4 +446,94 @@ class ICFusionDetector(MVXTwoStageDetector):
                 img_feats, img_metas, rescale=rescale)
             for result_dict, img_bbox in zip(bbox_list, bbox_img):
                 result_dict['img_bbox'] = img_bbox
-        return bbox_list
+        return bbox_list, bbox_index, attn_weights
+
+
+    def show_results(self, data, result, out_dir, show_img=False):
+        """Results visualization.
+
+        Args:
+            data (list[dict]): Input points and the information of the sample.
+            result (list[dict]): Prediction results.
+            out_dir (str): Output directory of visualization result.
+            show (bool, optional): Determines whether you are
+                going to show result by open3d.
+                Defaults to False.
+            score_thr (float, optional): Score threshold of bounding boxes.
+                Default to None.
+        """
+        COLOR_MAP = {
+            'red': np.array([191, 4, 54]) / 256,
+            'light_blue': np.array([4, 157, 217]) / 256,
+            'black': np.array([0, 0, 0]) / 256,
+            'gray': np.array([140, 140, 136]) / 256,
+            'purple': np.array([224, 133, 250]) / 256, 
+            'dark_green': np.array([32, 64, 40]) / 256,
+            'green': np.array([77, 115, 67]) / 256,
+            'brown': np.array([164, 103, 80]) / 256,
+            'light_green': np.array([135, 206, 191]) / 256,
+            'orange': np.array([229, 116, 57]) / 256,
+        }
+
+        COLOR_KEYS = list(COLOR_MAP.keys())
+
+        import matplotlib.pyplot as plt
+        for batch_id in range(len(result)):
+            if isinstance(data['points'][0], DC):
+                points = data['points'][0]._data[0][batch_id].numpy()
+            elif mmcv.is_list_of(data['points'][0], torch.Tensor):
+                points = data['points'][0][batch_id]
+            else:
+                ValueError(f"Unsupported data type {type(data['points'][0])} "
+                           f'for visualization!')
+            if isinstance(data['img_metas'][0], DC):
+                pts_filename = data['img_metas'][0]._data[0][batch_id][
+                    'pts_filename']
+                box_mode_3d = data['img_metas'][0]._data[0][batch_id][
+                    'box_mode_3d']
+                
+            elif mmcv.is_list_of(data['img_metas'][0], dict):
+                pts_filename = data['img_metas'][0][batch_id]['pts_filename']
+                box_mode_3d = data['img_metas'][0][batch_id]['box_mode_3d']
+            else:
+                ValueError(
+                    f"Unsupported data type {type(data['img_metas'][0])} "
+                    f'for visualization!')
+            if isinstance(data['img'][0], DC):
+                img = data['img'][0]._data[0][batch_id].cpu().numpy()
+            file_name = osp.split(pts_filename)[-1].split('.')[0]
+
+            assert out_dir is not None, 'Expect out_dir, got none.'
+
+            pred_bboxes = result[batch_id]['pts_bbox']['boxes_3d']
+            pred_labels = result[batch_id]['pts_bbox']['labels_3d']
+            scores = result[batch_id]['pts_bbox']['scores_3d']
+
+            # for now we convert points and bbox into depth mode
+            if (box_mode_3d == Box3DMode.CAM) or (box_mode_3d
+                                                  == Box3DMode.LIDAR):
+                points = Coord3DMode.convert_point(points, Coord3DMode.LIDAR,
+                                                   Coord3DMode.DEPTH)
+                pred_bboxes = Box3DMode.convert(pred_bboxes, box_mode_3d,
+                                                Box3DMode.DEPTH)
+            elif box_mode_3d != Box3DMode.DEPTH:
+                ValueError(
+                    f'Unsupported box_mode_3d {box_mode_3d} for conversion!')
+            pred_bboxes = pred_bboxes.tensor.cpu().numpy()
+
+            self.figure = plt.figure(figsize=(20, 20))
+            plt.axis('off')
+            mask = (np.max(points, axis=-1) < 60)
+            pc = points[mask]
+            vis_pc = np.asarray(pc)
+            plt.scatter(vis_pc[:, 0], vis_pc[:, 1], marker='o', color=COLOR_MAP['gray'], s=0.01)
+
+            for box, score in pred_bboxes, scores:
+                if score < 0.4:
+                    continue
+                corners = box.corners[0][[0,3,4,7]][:,:2]
+                corners = np.concatenate([corners, corners[0:1, :2]])
+                plt.plot(corners[:, 0], corners[:, 1], color=COLOR_MAP[0], linestyle='solid')
+            
+            if show_img:
+                plt.imshow(img)    

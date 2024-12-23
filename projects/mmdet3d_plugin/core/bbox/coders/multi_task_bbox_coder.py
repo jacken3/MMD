@@ -217,7 +217,8 @@ class NMSFreeCoder(BaseBBoxCoder):
             predictions_dict = {
                 'bboxes': boxes3d,
                 'scores': scores,
-                'labels': labels
+                'labels': labels,
+                'bbox_index': bbox_index[mask]
             }
 
         else:

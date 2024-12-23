@@ -580,11 +580,10 @@ class ICFusionHead(BaseModule):
                 reference_points = self.generate_reference_points(x_img, proposals, reference_points, img_metas)
 
         reference_points, attn_mask, mask_dict = self.prepare_for_dn(bs, reference_points, img_metas)
-        
         # query_pe
         query_embeds = self.query_embed(reference_points, img_metas)
 
-        outs_dec, _ = self.transformer(
+        outs_dec, _, attn_weights = self.transformer(
                             x, x_img, query_embeds,
                             bev_pos_embeds, rv_pos_embeds,
                             attn_masks=attn_mask,
@@ -636,6 +635,7 @@ class ICFusionHead(BaseModule):
                 'dn_mask_dict': None,
             }
 
+        outs['attn_weights'] = attn_weights
         return outs
 
     def forward(self, pts_feats, img_feats=None, img_metas=None, proposals=None):
@@ -913,7 +913,7 @@ class ICFusionHead(BaseModule):
         preds_dicts = self.bbox_coder.decode(preds_dicts)
         num_samples = len(preds_dicts)
         
-        ret_list = []
+        ret_list, bbox_index = [], []
         for i in range(num_samples):
             preds = preds_dicts[i]
             bboxes = preds['bboxes']
@@ -921,5 +921,6 @@ class ICFusionHead(BaseModule):
             bboxes = img_metas[i]['box_type_3d'](bboxes, bboxes.size(-1))
             scores = preds['scores']
             labels = preds['labels']
+            bbox_index.append(preds['bbox_index'])
             ret_list.append([bboxes, scores, labels])
-        return ret_list
+        return ret_list, bbox_index

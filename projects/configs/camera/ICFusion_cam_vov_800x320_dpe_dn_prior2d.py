@@ -451,7 +451,7 @@ workflow = [('train', 1)]
 gpu_ids = range(0, 8)
 
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
-load_from='work_dirs/mmd_camera_vov_800x320_new_codebase_test_dpe_dn_prior2d_2d/latest.pth'
+load_from='ckpts/camera_vov_800x320_2d_pretrain.pth'
 resume_from=None
 
 

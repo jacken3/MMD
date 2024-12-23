@@ -243,17 +243,17 @@ class PETRMultiheadAttention(BaseModule):
             key = key.transpose(0, 1)
             value = value.transpose(0, 1)
 
-        out = self.attn(
+        out, attn_weight = self.attn(
             query=query,
             key=key,
             value=value,
             attn_mask=attn_mask,
-            key_padding_mask=key_padding_mask)[0]
+            key_padding_mask=key_padding_mask)
 
         if self.batch_first:
             out = out.transpose(0, 1)
 
-        return identity + self.dropout_layer(self.proj_drop(out))
+        return identity + self.dropout_layer(self.proj_drop(out)), attn_weight
 
 
 from .attention import FlashMHA
@@ -388,16 +388,16 @@ class PETRMultiheadFlashAttention(BaseModule):
             key = key.transpose(0, 1)
             value = value.transpose(0, 1)
         
-        out = self.attn(
+        out, attn_weight = self.attn(
             q=query,
             k=key,
             v=value,
-            key_padding_mask=None)[0]
+            key_padding_mask=None)
 
         if self.batch_first:
             out = out.transpose(0, 1)
 
-        return identity + self.dropout_layer(self.proj_drop(out))
+        return identity + self.dropout_layer(self.proj_drop(out)), attn_weight
 
 
 @TRANSFORMER_LAYER_SEQUENCE.register_module()
@@ -439,15 +439,17 @@ class PETRTransformerDecoder(TransformerLayerSequence):
                 x = self.post_norm(x)[None]
             return x
 
-        intermediate = []
+        intermediate, attn_weights = [], []
         for layer in self.layers:
-            query = layer(query, *args, **kwargs)
+            query, attn_weight = layer(query, *args, **kwargs)
             if self.return_intermediate:
                 if self.post_norm is not None:
                     intermediate.append(self.post_norm(query))
+                    attn_weights.append(attn_weight)
                 else:
                     intermediate.append(query)
-        return torch.stack(intermediate)
+                    attn_weights.append(attn_weight)
+        return torch.stack(intermediate), attn_weights
 
 
 @TRANSFORMER_LAYER.register_module()
@@ -505,23 +507,83 @@ class PETRTransformerDecoderLayer(BaseTransformerLayer):
                 attn_masks=None,
                 query_key_padding_mask=None,
                 key_padding_mask=None,
+                **kwargs
                 ):
         """Forward function for `TransformerCoder`.
         Returns:
             Tensor: forwarded results with shape [num_query, bs, embed_dims].
         """
-        x = super(PETRTransformerDecoderLayer, self).forward(
-                query,
-                key=key,
-                value=value,
-                query_pos=query_pos,
-                key_pos=key_pos,
-                attn_masks=attn_masks,
-                query_key_padding_mask=query_key_padding_mask,
-                key_padding_mask=key_padding_mask,
-                )
+        # x = super(PETRTransformerDecoderLayer, self).forward(
+        #         query,
+        #         key=key,
+        #         value=value,
+        #         query_pos=query_pos,
+        #         key_pos=key_pos,
+        #         attn_masks=attn_masks,
+        #         query_key_padding_mask=query_key_padding_mask,
+        #         key_padding_mask=key_padding_mask,
+        #         )
 
-        return x
+        # return x
+    
+        norm_index = 0
+        attn_index = 0
+        ffn_index = 0
+        identity = query
+        if attn_masks is None:
+            attn_masks = [None for _ in range(self.num_attn)]
+        elif isinstance(attn_masks, torch.Tensor):
+            attn_masks = [
+                copy.deepcopy(attn_masks) for _ in range(self.num_attn)
+            ]
+            warnings.warn(f'Use same attn_mask in all attentions in '
+                          f'{self.__class__.__name__} ')
+        else:
+            assert len(attn_masks) == self.num_attn, f'The length of ' \
+                        f'attn_masks {len(attn_masks)} must be equal ' \
+                        f'to the number of attention in ' \
+                        f'operation_order {self.num_attn}'
+
+        for layer in self.operation_order:
+            if layer == 'self_attn':
+                temp_key = temp_value = query
+                query = self.attentions[attn_index](
+                    query,
+                    temp_key,
+                    temp_value,
+                    identity if self.pre_norm else None,
+                    query_pos=query_pos,
+                    key_pos=query_pos,
+                    attn_mask=attn_masks[attn_index],
+                    key_padding_mask=query_key_padding_mask,
+                    **kwargs)
+                attn_index += 1
+                identity = query
+
+            elif layer == 'norm':
+                query = self.norms[norm_index](query)
+                norm_index += 1
+
+            elif layer == 'cross_attn':
+                query, attn_weight = self.attentions[attn_index](
+                    query,
+                    key,
+                    value,
+                    identity if self.pre_norm else None,
+                    query_pos=query_pos,
+                    key_pos=key_pos,
+                    attn_mask=attn_masks[attn_index],
+                    key_padding_mask=key_padding_mask,
+                    **kwargs)
+                attn_index += 1
+                identity = query
+
+            elif layer == 'ffn':
+                query = self.ffns[ffn_index](
+                    query, identity if self.pre_norm else None)
+                ffn_index += 1
+
+        return query, attn_weight
 
     def forward(self, 
                 query,
@@ -540,7 +602,7 @@ class PETRTransformerDecoderLayer(BaseTransformerLayer):
         """
 
         if self.use_checkpoint and self.training:
-            x = cp.checkpoint(
+            x, attn_weight = cp.checkpoint(
                 self._forward, 
                 query,
                 key,
@@ -552,7 +614,7 @@ class PETRTransformerDecoderLayer(BaseTransformerLayer):
                 key_padding_mask,
                 )
         else:
-            x = self._forward(
+            x, attn_weight = self._forward(
             query,
             key=key,
             value=value,
@@ -563,4 +625,4 @@ class PETRTransformerDecoderLayer(BaseTransformerLayer):
             key_padding_mask=key_padding_mask
             )
         
-        return x
+        return x, attn_weight

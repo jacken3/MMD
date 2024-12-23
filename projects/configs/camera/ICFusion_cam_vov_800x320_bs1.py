@@ -24,7 +24,7 @@ input_modality = dict(
     use_map=False,
     use_external=True)
 model = dict(
-    type='CmtDetector',
+    type='ICFusionDetector',
     use_grid_mask=True,
     img_backbone=dict(
         type='VoVNetCP',
@@ -39,7 +39,7 @@ model = dict(
         out_channels=256,
         num_outs=2),
     pts_bbox_head=dict(
-        type='CmtHead',
+        type='ICFusionHead',
         input_modality=dict(
                     use_lidar=False,
                     use_camera=True,
@@ -172,7 +172,7 @@ train_pipeline = [
             rot_range=[-0.3925, 0.3925],
             translation_std=[0, 0, 0],
             scale_ratio_range=[0.95, 1.05],
-            reverse_angle=True,
+            reverse_angle=False,
             training=True
             ),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
@@ -275,7 +275,4 @@ gpu_ids = range(0, 8)
 
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
 load_from='ckpts/fcos3d_vovnet_imgbackbone-remapped.pth'
-resume_from='work_dirs/mmd_camera_vov_800x320_new_codebase_test/latest.pth'
-
-
-
+resume_from=None

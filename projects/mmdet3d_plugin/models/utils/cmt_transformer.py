@@ -134,7 +134,7 @@ class CmtTransformer(BaseModule):
         target = torch.zeros_like(query_embed)
         
         # Decoder pass
-        out_dec = self.decoder(
+        out_dec, attn_weights = self.decoder(
             query=target,
             key=memory,
             value=memory,
@@ -146,7 +146,7 @@ class CmtTransformer(BaseModule):
         )
         
         out_dec = out_dec.transpose(1, 2)
-        return out_dec, memory
+        return out_dec, memory, attn_weights
 
 
 @TRANSFORMER.register_module()
