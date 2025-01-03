@@ -239,8 +239,8 @@ class NMSFreeCoder(BaseBBoxCoder):
         Returns:
             list[dict]: Decoded boxes.
         """
-        all_cls_scores = preds_dicts['all_cls_scores'][-1]
-        all_bbox_preds = preds_dicts['all_bbox_preds'][-1]
+        all_cls_scores = preds_dicts['all_cls_scores'][-1].contiguous()
+        all_bbox_preds = preds_dicts['all_bbox_preds'][-1].contiguous()
         
         batch_size = all_cls_scores.size()[0]
         predictions_list = []

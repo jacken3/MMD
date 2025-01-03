@@ -8,6 +8,7 @@ class_names = [
 ]
 voxel_size = [0.075, 0.075, 0.2]
 out_size_factor = 8
+num_layers = 6
 evaluation = dict(interval=20)
 dataset_type = 'CustomNuScenesDataset'
 data_root = 'data/nuscenes/'
@@ -160,7 +161,7 @@ data = dict(
         test_mode=True,
         box_type_3d='LiDAR'))
 model = dict(
-    type='CmtDetector',
+    type='ICFusionDetector',
     pts_voxel_layer=dict(
         num_point_features=5,
         max_num_points=10,
@@ -197,7 +198,7 @@ model = dict(
         upsample_cfg=dict(type='deconv', bias=False),
         use_conv_for_no_stride=True),
     pts_bbox_head=dict(
-        type='CmtHead',
+        type='ICFusionHead',
         input_modality=dict(
                     use_lidar=True,
                     use_camera=False,
@@ -206,15 +207,25 @@ model = dict(
         with_dn=True,
         pts_in_channels=512,
         hidden_dim=256,
-        bg_cls_weight=0, #背景类的权重
+        query_3dpe=True,
+        bg_cls_weight=0.1, #背景类的权重, 在CMT里面取的是0.1
         downsample_scale=8,
+        use_separate_head=True,
+        separate_head=dict(
+            type='SeparateTaskHead', 
+            in_channels=256, # hidden_dim
+            heads = dict(center=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2), cls_logits=(10, 2)),
+            groups=num_layers, # decoder_layers
+            head_conv=64,
+            final_kernel=3,
+            init_bias=-2.19),
         bbox_coder=dict(
             type='NMSFreeCoder',
             post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
             pc_range=point_cloud_range,
             max_num=300,
             voxel_size=voxel_size,
-            num_classes=10),  
+            num_classes=10), 
         transformer=dict(
             type='CmtTransformer',
             decoder=dict(
@@ -235,8 +246,15 @@ model = dict(
                             num_heads=8,
                             dropout=0.1),
                         ],
-                    feedforward_channels=2048,
-                    ffn_dropout=0.1,
+                    ffn_cfgs=dict(
+                        type='FFN',
+                        embed_dims=256,
+                        feedforward_channels=1024,
+                        num_fcs=2,
+                        ffn_drop=0.,
+                        act_cfg=dict(type='ReLU', inplace=True),
+                    ),
+                    feedforward_channels=1024,#unused
                     operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
                                      'ffn', 'norm')),
             )),
@@ -253,6 +271,7 @@ model = dict(
                 reg_cost=dict(type='BBox3DL1Cost', weight=0.25),
                 iou_cost=dict(type='IoUCost', weight=0.0), # Fake cost. This is just to make it compatible with DETR head. 
                 pc_range=point_cloud_range,
+                code_weights=[2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2],
             ),
             pos_weight=-1,
             gaussian_overlap=0.1,
@@ -260,7 +279,7 @@ model = dict(
             grid_size=[1440, 1440, 40],  # [x_len, y_len, 1]
             voxel_size=voxel_size,
             out_size_factor=out_size_factor,
-            code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2],
+            code_weights=[2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2],
             point_cloud_range=point_cloud_range)),
     test_cfg=dict(
         pts=dict(

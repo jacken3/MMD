@@ -10,7 +10,7 @@ roi_srides = [16]
 
 # If point cloud range is changed, the models should also change their point
 # cloud range accordingly
-point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+point_cloud_range = [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
 voxel_size = [0.2, 0.2, 8]
 img_norm_cfg = dict(
     mean=[103.530, 116.280, 123.675], std=[57.375, 57.120, 58.395], to_rgb=False)
@@ -29,8 +29,8 @@ model = dict(
     type='ICFusionDetector',
     use_grid_mask=True,
     if_2d_prior=True,
-    extra_fpn = True,
-    if_3d_detection=True,
+    extra_fpn = False,
+    if_3d_detection=False,
     img_backbone=dict(
         type='VoVNetCP',
         spec_name='V-99-eSE',
@@ -143,98 +143,12 @@ model = dict(
                 nms=dict(type='nms', iou_threshold=0.7),
                 min_bbox_size=0),
             rcnn=dict(
-                score_thr=0.1,
+                score_thr=0.05,
                 nms=dict(type='nms', iou_threshold=0.5),
                 max_per_img=100,
                 mask_thr_binary=0.5))
         ),
-    pts_bbox_head=dict(
-        type='ICFusionHead',
-        input_modality=dict(
-                    use_lidar=False,
-                    use_camera=True,
-                 ),
-        num_classes=10,
-        with_dn=True,
-        pts_in_channels=256,
-        num_query=600,
-        LID=True,
-        with_multiview=True,
-        hidden_dim=256,
-        bg_cls_weight=0, #背景类的权重
-        if_depth_pe=True, # 是否对图像进行深度位置编码
-        share_pe=False, # 只有在if_depth_pe为True时，该参数才有效，是否和query共享深度位置编码
-        generate_with_pe=True, # 是否使用位置编码生成query,需要配合if_2d_prior=True使用
-        downsample_scale=8,
-        position_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
-        normedlinear=False,
-        bbox_roi_extractor=dict(
-            type='SingleRoIExtractor',
-            roi_layer=dict(type='RoIAlign', output_size=roi_size, sampling_ratio=-1),
-            featmap_strides=roi_srides,
-            out_channels=512, ),
-        query_generator=dict(
-            with_avg_pool=True,
-            num_shared_convs=1,
-            num_shared_fcs=1,
-            in_channels=256,
-            fc_out_channels=1024,
-            roi_feat_size=roi_size,
-            extra_encoding=dict(
-                num_layers=2,
-                feat_channels=[512, 256],
-                features=[dict(type='intrinsic', in_channels=16,)]
-            ),
-            loss_cls=dict(
-                type='FocalLoss',
-                use_sigmoid=True,
-                gamma=2.0,
-                alpha=0.25,
-                loss_weight=2.0,
-            ),
-        ),
-        transformer=dict(
-            type='CmtTransformer',
-            decoder=dict(
-                type='PETRTransformerDecoder',
-                return_intermediate=True,
-                num_layers=6,
-                transformerlayers=dict(
-                    type='PETRTransformerDecoderLayer',
-                    attn_cfgs=[
-                        dict(
-                            type='MultiheadAttention',
-                            embed_dims=256,
-                            num_heads=8,
-                            dropout=0.1),
-                        dict(
-                            type='PETRMultiheadAttention',
-                            embed_dims=256,
-                            num_heads=8,
-                            dropout=0.1),
-                        ],
-                    feedforward_channels=2048,
-                    ffn_dropout=0.1,
-                    operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
-                                     'ffn', 'norm')),
-            )),
-        bbox_coder=dict(
-            type='NMSFreeCoder',
-            post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
-            pc_range=point_cloud_range,
-            max_num=300,
-            voxel_size=voxel_size,
-            num_classes=10), 
-        positional_encoding=dict(
-            type='SinePositionalEncoding3D', num_feats=128, normalize=True),
-        loss_cls=dict(
-            type='FocalLoss',
-            use_sigmoid=True,
-            gamma=2.0,
-            alpha=0.25,
-            loss_weight=2.0),
-        loss_bbox=dict(type='L1Loss', loss_weight=0.25),
-        loss_iou=dict(type='GIoULoss', loss_weight=0.0)),
+    pts_bbox_head=None,
     # model training and testing settings
     train_cfg=dict(pts=dict(
         code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2],
@@ -290,8 +204,8 @@ db_sampler = dict(
         use_dim=[0, 1, 2, 3, 4],
         file_client_args=file_client_args))
 ida_aug_conf = {
-        "resize_lim": (0.47, 0.625),
-        "final_dim": (320, 800),
+        "resize_lim": (0.94, 1.25),
+        "final_dim": (640, 1600),
         "bot_pct_lim": (0.0, 0.0),
         "rot_lim": (0.0, 0.0),
         "H": 900,
@@ -379,7 +293,7 @@ test_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=2,
+    samples_per_gpu=4,
     workers_per_gpu=6,
     train=dict(
         type=dataset_type,
@@ -420,7 +334,7 @@ data = dict(
 
 optimizer = dict(
     type='AdamW',
-    lr=4e-4,
+    lr=8e-4,
     paramwise_cfg=dict(
         custom_keys={
             'img_backbone': dict(lr_mult=0.1),
@@ -451,7 +365,7 @@ workflow = [('train', 1)]
 gpu_ids = range(0, 8)
 
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
-load_from='work_dirs/mmd_camera_vov_800x320_new_codebase_test_dpe_dn_prior2d_2d/latest.pth'
+load_from='ckpts/fcos3d_vovnet_imgbackbone-remapped.pth'
 resume_from=None
 
 

@@ -52,8 +52,9 @@ model = dict(
         with_multiview=True,
         hidden_dim=256,
         bg_cls_weight=0, #背景类的权重
-        if_depth_pe=False, # 是否对图像进行深度位置编码
+        if_depth_pe=True, # 是否对图像进行深度位置编码
         share_pe=False, # 只有在if_depth_pe为True时，该参数才有效，是否和query共享深度位置编码
+        query_3dpe=True,
         downsample_scale=8,
         position_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
         normedlinear=False,
@@ -72,7 +73,7 @@ model = dict(
                             num_heads=8,
                             dropout=0.1),
                         dict(
-                            type='PETRMultiheadAttention',
+                            type='PETRMultiheadFlashAttention',
                             embed_dims=256,
                             num_heads=8,
                             dropout=0.1),
@@ -163,11 +164,23 @@ ida_aug_conf = {
         "rand_flip": True,
     }
 train_pipeline = [
+    dict(
+        type='LoadPointsFromFile',
+        coord_type='LIDAR',
+        load_dim=5,
+        use_dim=[0, 1, 2, 3, 4],
+    ),
     dict(type='LoadMultiViewImageFromFiles', to_float32=True),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_attr_label=False),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='ObjectNameFilter', classes=class_names),
     dict(type='ResizeCropFlipImage', data_aug_conf = ida_aug_conf, training=True),
+    dict(
+        type='LoadDepthByMapplingPoints2Images',
+        src_size=(900, 1600),
+        input_size=ida_aug_conf['final_dim'],
+        downsample=16
+    ),
     dict(type='GlobalRotScaleTransImage',
             rot_range=[-0.3925, 0.3925],
             translation_std=[0, 0, 0],
@@ -186,11 +199,23 @@ train_pipeline = [
                     'img_norm_cfg', 'pcd_trans', 'sample_idx',
                     'pcd_scale_factor', 'pcd_rotation', 'pts_filename',
                     'transformation_3d_flow', 'rot_degree',
-                    'gt_bboxes_3d', 'gt_labels_3d'))
+                    'gt_bboxes_3d', 'gt_labels_3d', 'depth_map', 'depth_map_mask'))
 ]
 test_pipeline = [
+    dict(
+        type='LoadPointsFromFile',
+        coord_type='LIDAR',
+        load_dim=5,
+        use_dim=[0, 1, 2, 3, 4],
+    ),
     dict(type='LoadMultiViewImageFromFiles', to_float32=True),
     dict(type='ResizeCropFlipImage', data_aug_conf = ida_aug_conf, training=False),
+    dict(
+        type='LoadDepthByMapplingPoints2Images',
+        src_size=(900, 1600),
+        input_size=ida_aug_conf['final_dim'],
+        downsample=16
+    ),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='PadMultiViewImage', size_divisor=32),
     dict(
@@ -203,13 +228,21 @@ test_pipeline = [
                 type='DefaultFormatBundle3D',
                 class_names=class_names,
                 with_label=False),
-            dict(type='Collect3D', keys=['img'])
+            dict(type='Collect3D', keys=['img'],
+                meta_keys=('filename', 'ori_shape', 'img_shape', 'lidar2img',
+                        'depth2img', 'cam2img', 'pad_shape',
+                        'scale_factor', 'flip', 'pcd_horizontal_flip',
+                        'pcd_vertical_flip', 'box_mode_3d', 'box_type_3d',
+                        'img_norm_cfg', 'pcd_trans', 'sample_idx',
+                        'pcd_scale_factor', 'pcd_rotation', 'pts_filename',
+                        'transformation_3d_flow', 'rot_degree',
+                        'gt_bboxes_3d', 'gt_labels_3d', 'depth_map', 'depth_map_mask'),)
         ])
 ]
 
 data = dict(
     samples_per_gpu=2,
-    workers_per_gpu=4,
+    workers_per_gpu=6,
     train=dict(
         type=dataset_type,
         data_root=data_root,

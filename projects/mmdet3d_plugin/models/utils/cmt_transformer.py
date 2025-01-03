@@ -107,8 +107,8 @@ class CmtTransformer(BaseModule):
         
         # If only x is provided (single modality)
         if x is not None:
-            bev_memory = rearrange(x, "bs c h w -> (h w) bs c")  # [bs, c, h, w] -> [n*h*w, bs, c]
-            bev_pos_embed = bev_pos_embed.unsqueeze(1).repeat(1, bs, 1) if bev_pos_embed is not None else None
+            bev_memory = rearrange(x, "bs n c -> n bs c")  # [bs, c, h, w] -> [n*h*w, bs, c]
+            bev_pos_embed = rearrange(bev_pos_embed, "bs n c -> n bs c") if bev_pos_embed is not None else None
             memory = bev_memory
             pos_embed = bev_pos_embed
         else:

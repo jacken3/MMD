@@ -101,7 +101,8 @@ class ICFusionDetector(MVXTwoStageDetector):
                                                 )
         batch_size = coors[-1, 0] + 1
         x = self.pts_middle_encoder(voxel_features, coors, batch_size)
-        x = self.pts_backbone(x)
+        if self.with_pts_backbone:
+            x = self.pts_backbone(x)
         if self.with_pts_neck:
             x = self.pts_neck(x)
         return x
@@ -305,6 +306,9 @@ class ICFusionDetector(MVXTwoStageDetector):
         # img.shape = [N, 3, H_img, W_img]
         _, C, H_img, W_img = img.shape
 
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
         for q_idx in range(Q):
             attn_map_q = attn_weights2visual[q_idx]  
             global_min = attn_map_q.min()
@@ -347,24 +351,25 @@ class ICFusionDetector(MVXTwoStageDetector):
                 overlay = out_pil.convert('RGB')                  # 转回 RGB (H×W×3)
 
                 # 转回 numpy array (uint8, 0~255)
-                overlay = np.array(overlay, dtype=np.uint8)
+                # overlay = np.array(overlay, dtype=np.uint8)
 
-                plt.figure(figsize=(10, 5))
-                plt.suptitle(f"Query {q_idx}, Camera {cam_idx} (Unified Norm)", fontsize=14)
+                # plt.figure(figsize=(10, 5))
+                # plt.suptitle(f"Query {q_idx}, Camera {cam_idx} (Unified Norm)", fontsize=14)
 
-                plt.subplot(1, 2, 1)
-                plt.imshow(img_cam_np)
-                plt.title("Original Image")
-                plt.axis("off")
+                # plt.subplot(1, 2, 1)
+                # plt.imshow(img_cam_np)
+                # plt.title("Original Image")
+                # plt.axis("off")
 
-                plt.subplot(1, 2, 2)
-                plt.imshow(overlay)
-                plt.title("Attn Overlay")
-                plt.axis("off")
+                # plt.subplot(1, 2, 2)
+                # plt.imshow(overlay)
+                # plt.title("Attn Overlay")
+                # plt.axis("off")
 
                 save_path = os.path.join(save_dir, f"query_{q_idx}_cam_{cam_idx}.png")
-                plt.savefig(save_path, bbox_inches='tight')
-                plt.close()  # 关闭图窗，防止内存占用过多
+                overlay.save(save_path, format='PNG')
+                # plt.savefig(save_path, bbox_inches='tight')
+                # plt.close()  # 关闭图窗，防止内存占用过多
 
     def forward_test(self,
                      points=None,
@@ -398,7 +403,7 @@ class ICFusionDetector(MVXTwoStageDetector):
             attn_weights = [attn.cpu() for attn in attn_weights]
 
             attn_weights2visual = attn_weights[3][0][bbox_index[0][torch.where(result[0]['pts_bbox']['scores_3d'] > 0.4)[0]]].reshape(-1,6,20,50)
-            self.visualize_attention_maps(attn_weights2visual, img[0], alpha=0.5)
+            self.visualize_attention_maps(attn_weights2visual, img[0], alpha=0.5, save_dir='visual/dep_2dPrior/'+img_metas[0][0]['sample_idx'])
     
         return result
     

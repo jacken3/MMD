@@ -5,6 +5,8 @@ _base_ = [
 backbone_norm_cfg = dict(type='LN', requires_grad=True)
 plugin=True
 plugin_dir='projects/mmdet3d_plugin/'
+roi_size = 7
+roi_srides = [16]
 
 # If point cloud range is changed, the models should also change their point
 # cloud range accordingly
@@ -26,18 +28,126 @@ input_modality = dict(
 model = dict(
     type='ICFusionDetector',
     use_grid_mask=True,
+    if_2d_prior=True,
+    extra_fpn = True,
+    if_3d_detection=True,
     img_backbone=dict(
         type='VoVNetCP',
         spec_name='V-99-eSE',
         norm_eval=True,
         frozen_stages=-1,
         input_ch=3,
-        out_features=('stage4','stage5',)),
+        out_features=('stage2', 'stage3', 'stage4', 'stage5')),
     img_neck=dict(
         type='CPFPN',
-        in_channels=[768, 1024],
+        in_channels=[256, 512, 768, 1024],
         out_channels=256,
+        num_outs=5),
+    extra_neck=dict(
+        type='CPFPN',
+        in_channels=[256, 256, 256, 256, 256],
+        out_channels=256,
+        start_level=2,
+        end_level=4,
         num_outs=2),
+    bbox_head_2d=dict(
+        type='Prior2D',
+        rpn_head=dict(
+            type='RPNHead',
+            in_channels=256,
+            feat_channels=256,
+            anchor_generator=dict(
+                type='AnchorGenerator',
+                scales=[8],
+                ratios=[0.5, 1.0, 2.0],
+                strides=[4, 8, 16, 32, 64]),
+            bbox_coder=dict(
+                type='DeltaXYWHBBoxCoder',
+                target_means=[.0, .0, .0, .0],
+                target_stds=[1.0, 1.0, 1.0, 1.0]),
+            loss_cls=dict(
+                type='CrossEntropyLoss', use_sigmoid=True, loss_weight=1.0),
+            loss_bbox=dict(type='L1Loss', loss_weight=1.0)
+            ),
+        roi_head=dict(
+            type='StandardRoIHead',
+            bbox_roi_extractor=dict(
+                type='SingleRoIExtractor',
+                roi_layer=dict(type='RoIAlign', output_size=7, sampling_ratio=0),
+                out_channels=256,
+                featmap_strides=[4, 8, 16, 32]),
+            bbox_head=dict(
+                type='Shared2FCBBoxHead',
+                in_channels=256,
+                fc_out_channels=1024,
+                roi_feat_size=7,
+                num_classes=10,
+                bbox_coder=dict(
+                    type='DeltaXYWHBBoxCoder',
+                    target_means=[0., 0., 0., 0.],
+                    target_stds=[0.1, 0.1, 0.2, 0.2]),
+                reg_class_agnostic=False,
+                loss_cls=dict(
+                    type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0),
+                loss_bbox=dict(type='L1Loss', loss_weight=1.0)),
+        ),
+        # model training and testing settings
+        train_cfg=dict(
+            detection_proposal=dict(
+                complement_2d_gt=0.4,
+                min_bbox_size=8,
+            ), # 用于设置3D检测器时,对2D检测结果的筛选
+            rpn=dict(
+                assigner=dict(
+                    type='MaxIoUAssigner',
+                    pos_iou_thr=0.7,
+                    neg_iou_thr=0.3,
+                    min_pos_iou=0.3,
+                    match_low_quality=True,
+                    ignore_iof_thr=-1),
+                sampler=dict(
+                    type='RandomSampler',
+                    num=256,
+                    pos_fraction=0.5,
+                    neg_pos_ub=-1,
+                    add_gt_as_proposals=False),
+                allowed_border=-1,
+                pos_weight=-1,
+                debug=False),
+            rpn_proposal=dict(
+                nms_pre=2000,
+                max_per_img=1000,
+                nms=dict(type='nms', iou_threshold=0.7),
+                min_bbox_size=0),
+            rcnn=dict(
+                assigner=dict(
+                    type='MaxIoUAssigner',
+                    pos_iou_thr=0.5,
+                    neg_iou_thr=0.5,
+                    min_pos_iou=0.5,
+                    match_low_quality=True,
+                    ignore_iof_thr=-1),
+                sampler=dict(
+                    type='RandomSampler',
+                    num=512,
+                    pos_fraction=0.25,
+                    neg_pos_ub=-1,
+                    add_gt_as_proposals=True),
+                mask_size=28,
+                pos_weight=-1,
+                debug=False)),
+        test_cfg=dict(
+            rpn=dict(
+                nms_pre=1000,
+                max_per_img=1000,
+                nms=dict(type='nms', iou_threshold=0.7),
+                min_bbox_size=0),
+            rcnn=dict(
+                score_thr=0.1,
+                nms=dict(type='nms', iou_threshold=0.5),
+                max_per_img=100,
+                mask_thr_binary=0.5))
+        ),
     pts_bbox_head=dict(
         type='ICFusionHead',
         input_modality=dict(
@@ -47,17 +157,43 @@ model = dict(
         num_classes=10,
         with_dn=True,
         pts_in_channels=256,
-        num_query=900,
+        num_query=600,
         LID=True,
         with_multiview=True,
         hidden_dim=256,
         bg_cls_weight=0, #背景类的权重
         if_depth_pe=False, # 是否对图像进行深度位置编码
         share_pe=False, # 只有在if_depth_pe为True时，该参数才有效，是否和query共享深度位置编码
+        generate_with_pe=False, # 是否使用位置编码生成query,需要配合if_2d_prior=True使用
         query_3dpe=True,
         downsample_scale=8,
         position_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
         normedlinear=False,
+        bbox_roi_extractor=dict(
+            type='SingleRoIExtractor',
+            roi_layer=dict(type='RoIAlign', output_size=roi_size, sampling_ratio=-1),
+            featmap_strides=roi_srides,
+            out_channels=512, ),
+        query_generator=dict(
+            with_avg_pool=True,
+            num_shared_convs=1,
+            num_shared_fcs=1,
+            in_channels=256,
+            fc_out_channels=1024,
+            roi_feat_size=roi_size,
+            extra_encoding=dict(
+                num_layers=2,
+                feat_channels=[512, 256],
+                features=[dict(type='intrinsic', in_channels=16,)]
+            ),
+            loss_cls=dict(
+                type='FocalLoss',
+                use_sigmoid=True,
+                gamma=2.0,
+                alpha=0.25,
+                loss_weight=2.0,
+            ),
+        ),
         transformer=dict(
             type='CmtTransformer',
             decoder=dict(
@@ -164,11 +300,23 @@ ida_aug_conf = {
         "rand_flip": True,
     }
 train_pipeline = [
+    dict(
+        type='LoadPointsFromFile',
+        coord_type='LIDAR',
+        load_dim=5,
+        use_dim=[0, 1, 2, 3, 4],
+    ),
     dict(type='LoadMultiViewImageFromFiles', to_float32=True),
-    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_attr_label=False),
-    dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
-    dict(type='ObjectNameFilter', classes=class_names),
+    dict(type='CustomLoadAnnotations3D', with_bbox_2d=True, with_bbox_3d=True, with_label_3d=True, with_attr_label=False),
+    dict(type='CustomObjectRangeFilter', with_bbox_2d=True, point_cloud_range=point_cloud_range),
+    dict(type='CustomObjectNameFilter', with_bbox_2d=True, classes=class_names),
     dict(type='ResizeCropFlipImage', data_aug_conf = ida_aug_conf, training=True),
+    dict(
+        type='LoadDepthByMapplingPoints2Images',
+        src_size=(900, 1600),
+        input_size=ida_aug_conf['final_dim'],
+        downsample=16
+    ),
     dict(type='GlobalRotScaleTransImage',
             rot_range=[-0.3925, 0.3925],
             translation_std=[0, 0, 0],
@@ -178,8 +326,11 @@ train_pipeline = [
             ),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='PadMultiViewImage', size_divisor=32),
-    dict(type='DefaultFormatBundle3D', class_names=class_names),
-    dict(type='Collect3D', keys=['gt_bboxes_3d', 'gt_labels_3d', 'img'],
+    dict(type='CustomDefaultFormatBundle3D', class_names=class_names),
+    dict(type='CustomCollect3D', 
+         debug=False,
+         classes=class_names,
+         keys=['gt_bboxes_3d', 'gt_labels_3d', 'gt_bboxes_2d', 'gt_labels_2d', 'gt_bboxes_2d_to_3d', 'gt_bboxes_ignore','img'],
          meta_keys=('filename', 'ori_shape', 'img_shape', 'lidar2img',
                     'depth2img', 'cam2img', 'pad_shape',
                     'scale_factor', 'flip', 'pcd_horizontal_flip',
@@ -187,11 +338,23 @@ train_pipeline = [
                     'img_norm_cfg', 'pcd_trans', 'sample_idx',
                     'pcd_scale_factor', 'pcd_rotation', 'pts_filename',
                     'transformation_3d_flow', 'rot_degree',
-                    'gt_bboxes_3d', 'gt_labels_3d'))
+                    'gt_bboxes_3d', 'gt_labels_3d', 'depth_map', 'depth_map_mask', 'cam_intrinsic', 'lidar2cam'))
 ]
 test_pipeline = [
+    dict(
+        type='LoadPointsFromFile',
+        coord_type='LIDAR',
+        load_dim=5,
+        use_dim=[0, 1, 2, 3, 4],
+    ),
     dict(type='LoadMultiViewImageFromFiles', to_float32=True),
     dict(type='ResizeCropFlipImage', data_aug_conf = ida_aug_conf, training=False),
+    dict(
+        type='LoadDepthByMapplingPoints2Images',
+        src_size=(900, 1600),
+        input_size=ida_aug_conf['final_dim'],
+        downsample=16
+    ),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='PadMultiViewImage', size_divisor=32),
     dict(
@@ -204,7 +367,15 @@ test_pipeline = [
                 type='DefaultFormatBundle3D',
                 class_names=class_names,
                 with_label=False),
-            dict(type='Collect3D', keys=['img'])
+            dict(type='Collect3D', keys=['img'],
+                meta_keys=('filename', 'ori_shape', 'img_shape', 'lidar2img',
+                        'depth2img', 'cam2img', 'pad_shape',
+                        'scale_factor', 'flip', 'pcd_horizontal_flip',
+                        'pcd_vertical_flip', 'box_mode_3d', 'box_type_3d',
+                        'img_norm_cfg', 'pcd_trans', 'sample_idx',
+                        'pcd_scale_factor', 'pcd_rotation', 'pts_filename',
+                        'transformation_3d_flow', 'rot_degree',
+                        'gt_bboxes_3d', 'gt_labels_3d', 'depth_map', 'depth_map_mask', 'cam_intrinsic', 'lidar2cam'),)
         ])
 ]
 
@@ -215,6 +386,8 @@ data = dict(
         type=dataset_type,
         data_root=data_root,
         ann_file=data_root + 'nuscenes_infos_train.pkl',
+        return_2d_annos=True,
+        ann_file_2d=data_root + 'nuscenes_infos_train_mono3d.coco.json',
         pipeline=train_pipeline,
         classes=class_names,
         modality=input_modality,
@@ -225,6 +398,8 @@ data = dict(
         type=dataset_type,
         data_root=data_root,
         ann_file=data_root + '/nuscenes_infos_val.pkl',
+        return_2d_annos=True,
+        ann_file_2d=data_root + 'nuscenes_infos_val_mono3d.coco.json',
         load_interval=1,
         pipeline=test_pipeline,
         classes=class_names,
@@ -235,6 +410,8 @@ data = dict(
         type=dataset_type,
         data_root=data_root,
         ann_file=data_root + '/nuscenes_infos_val.pkl',
+        return_2d_annos=True,
+        ann_file_2d=data_root + 'nuscenes_infos_val_mono3d.coco.json',
         load_interval=1,
         pipeline=test_pipeline,
         classes=class_names,
@@ -275,5 +452,5 @@ workflow = [('train', 1)]
 gpu_ids = range(0, 8)
 
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
-load_from='ckpts/fcos3d_vovnet_imgbackbone-remapped.pth'
+load_from='ckpts/camera_vov_800x320_2d_pretrain.pth'
 resume_from=None

@@ -45,7 +45,7 @@ model = dict(
                     use_camera=True,
                  ),
         num_classes=10,
-        with_dn=False,
+        with_dn=True,
         pts_in_channels=256,
         num_query=900,
         LID=True,
@@ -54,6 +54,7 @@ model = dict(
         bg_cls_weight=0, #背景类的权重
         if_depth_pe=True, # 是否对图像进行深度位置编码
         share_pe=False, # 只有在if_depth_pe为True时，该参数才有效，是否和query共享深度位置编码
+        query_3dpe=True,
         downsample_scale=8,
         position_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
         normedlinear=False,

@@ -45,7 +45,7 @@ model = dict(
                     use_camera=True,
                  ),
         num_classes=10,
-        with_dn=False,
+        with_dn=True,
         pts_in_channels=256,
         num_query=900,
         LID=True,
@@ -54,6 +54,7 @@ model = dict(
         bg_cls_weight=0, #背景类的权重
         if_depth_pe=False, # 是否对图像进行深度位置编码
         share_pe=False, # 只有在if_depth_pe为True时，该参数才有效，是否和query共享深度位置编码
+        query_3dpe=True,
         downsample_scale=8,
         position_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
         normedlinear=False,
@@ -72,7 +73,7 @@ model = dict(
                             num_heads=8,
                             dropout=0.1),
                         dict(
-                            type='PETRMultiheadAttention',
+                            type='PETRMultiheadFlashAttention',
                             embed_dims=256,
                             num_heads=8,
                             dropout=0.1),
@@ -208,8 +209,8 @@ test_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=1,
-    workers_per_gpu=4,
+    samples_per_gpu=2,
+    workers_per_gpu=6,
     train=dict(
         type=dataset_type,
         data_root=data_root,
@@ -243,7 +244,7 @@ data = dict(
 
 optimizer = dict(
     type='AdamW',
-    lr=2e-4,
+    lr=4e-4,
     paramwise_cfg=dict(
         custom_keys={
             'img_backbone': dict(lr_mult=0.1),

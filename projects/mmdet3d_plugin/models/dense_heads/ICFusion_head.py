@@ -36,6 +36,7 @@ from mmdet.models.builder import build_roi_extractor
 from functools import reduce
 from projects.mmdet3d_plugin.core.bbox.util import normalize_bbox
 from projects.mmdet3d_plugin.models.utils.query_generator import QueryGenerator
+from projects.mmdet3d_plugin.models.utils.gaussian import gaussian_radius
 
 
 def pos2embed(pos, num_pos_feats=128, temperature=10000):
@@ -64,6 +65,157 @@ def pos2emb3d(pos, num_pos_feats=128, temperature=10000):
     posemb = torch.cat((pos_y, pos_x, pos_z), dim=-1)
     return posemb
 
+class LayerNormFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, groups, eps):
+        ctx.groups = groups
+        ctx.eps = eps
+        N, C, L = x.size()
+        x = x.view(N, groups, C // groups, L)
+        mu = x.mean(2, keepdim=True)
+        var = (x - mu).pow(2).mean(2, keepdim=True)
+        y = (x - mu) / (var + eps).sqrt()
+        ctx.save_for_backward(y, var, weight)
+        y = weight.view(1, C, 1) * y.view(N, C, L) + bias.view(1, C, 1)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        groups = ctx.groups
+        eps = ctx.eps
+
+        N, C, L = grad_output.size()
+        y, var, weight = ctx.saved_variables
+        g = grad_output * weight.view(1, C, 1)
+        g = g.view(N, groups, C//groups, L)
+        mean_g = g.mean(dim=2, keepdim=True)
+        mean_gy = (g * y).mean(dim=2, keepdim=True)
+        gx = 1. / torch.sqrt(var + eps) * (g - y * mean_gy - mean_g)
+        return gx.view(N, C, L), (grad_output * y.view(N, C, L)).sum(dim=2).sum(dim=0), grad_output.sum(dim=2).sum(
+            dim=0), None, None
+
+
+class GroupLayerNorm1d(nn.Module):
+
+    def __init__(self, channels, groups=1, eps=1e-6):
+        super(GroupLayerNorm1d, self).__init__()
+        self.register_parameter('weight', nn.Parameter(torch.ones(channels)))
+        self.register_parameter('bias', nn.Parameter(torch.zeros(channels)))
+        self.groups = groups
+        self.eps = eps
+
+    def forward(self, x):
+        return LayerNormFunction.apply(x, self.weight, self.bias, self.groups, self.eps)
+
+@HEADS.register_module()
+class SeparateTaskHead(BaseModule):
+    """SeparateHead for CenterHead.
+
+    Args:
+        in_channels (int): Input channels for conv_layer.
+        heads (dict): Conv information.
+        head_conv (int): Output channels.
+            Default: 64.
+        final_kernal (int): Kernal size for the last conv layer.
+            Deafult: 1.
+        init_bias (float): Initial bias. Default: -2.19.
+        conv_cfg (dict): Config of conv layer.
+            Default: dict(type='Conv2d')
+        norm_cfg (dict): Config of norm layer.
+            Default: dict(type='BN2d').
+        bias (str): Type of bias. Default: 'auto'.
+    """
+
+    def __init__(self,
+                 in_channels,
+                 heads,
+                 groups=1,
+                 head_conv=64,
+                 final_kernel=1,
+                 init_bias=-2.19,
+                 init_cfg=None,
+                 **kwargs):
+        assert init_cfg is None, 'To prevent abnormal initialization ' \
+            'behavior, init_cfg is not allowed to be set'
+        super(SeparateTaskHead, self).__init__(init_cfg=init_cfg)
+        self.heads = heads
+        self.groups = groups
+        self.init_bias = init_bias
+        for head in self.heads:
+            reg_output_dim, num_conv = self.heads[head]
+
+            conv_layers = []
+            c_in = in_channels
+            for i in range(num_conv - 1):
+                conv_layers.extend([
+                    nn.Conv1d(
+                        c_in * groups,
+                        head_conv * groups,
+                        kernel_size=final_kernel,
+                        stride=1,
+                        padding=final_kernel // 2,
+                        groups=groups,
+                        bias=False),
+                    GroupLayerNorm1d(head_conv * groups, groups=groups),
+                    nn.ReLU(inplace=True)
+                ])
+                c_in = head_conv
+
+            conv_layers.append(
+                nn.Conv1d(
+                    head_conv * groups,
+                    reg_output_dim * groups,
+                    kernel_size=final_kernel,
+                    stride=1,
+                    padding=final_kernel // 2,
+                    groups=groups,
+                    bias=True))
+            conv_layers = nn.Sequential(*conv_layers)
+
+            self.__setattr__(head, conv_layers)
+
+            if init_cfg is None:
+                self.init_cfg = dict(type='Kaiming', layer='Conv1d')
+
+    def init_weights(self):
+        """Initialize weights."""
+        super().init_weights()
+        for head in self.heads:
+            if head == 'cls_logits':
+                self.__getattr__(head)[-1].bias.data.fill_(self.init_bias)
+
+    def forward(self, x):
+        """Forward function for SepHead.
+
+        Args:
+            x (torch.Tensor): Input feature map with the shape of
+                [N, B, query, C].
+
+        Returns:
+            dict[str: torch.Tensor]: contains the following keys:
+
+                -reg （torch.Tensor): 2D regression value with the \
+                    shape of [N, B, query, 2].
+                -height (torch.Tensor): Height value with the \
+                    shape of [N, B, query, 1].
+                -dim (torch.Tensor): Size value with the shape \
+                    of [N, B, query, 3].
+                -rot (torch.Tensor): Rotation value with the \
+                    shape of [N, B, query, 2].
+                -vel (torch.Tensor): Velocity value with the \
+                    shape of [N, B, query, 2].
+        """
+        N, B, query_num, c1 = x.shape
+        x = rearrange(x, "n b q c -> b (n c) q")
+        ret_dict = dict()
+
+        for head in self.heads:
+             head_output = self.__getattr__(head)(x)
+             ret_dict[head] = rearrange(head_output, "b (n c) q -> n b q c", n=N)
+
+        return ret_dict
+
 @HEADS.register_module()
 class ICFusionHead(BaseModule):
 
@@ -80,10 +232,13 @@ class ICFusionHead(BaseModule):
                      type='SinePositionalEncoding',
                      num_feats=128,
                      normalize=True),
+                 use_separate_head = False,
+                 separate_head = None,
                  bg_cls_weight = 0,
                  if_depth_pe=False,
                  share_pe=False,
-                 query_3dpe=True,
+                 query_3dpe=False,
+                 lidar_3d_pe=False,
                  generate_with_pe=False,
                  depth_start=1,
                  downsample_scale=8,
@@ -96,6 +251,13 @@ class ICFusionHead(BaseModule):
                  if_2d_prior=False,
                  query_generator=None,
                  bbox_roi_extractor=None,
+                 if_3d_prior=False,
+                 heatmap_layer=dict(
+                    num_conv = 2,
+                    proposal_head_kernel = 3
+                ),
+                 max_foreground_token=10000,
+                 num_3d_proposals=200,
                  position_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
                  train_cfg=None,
                  test_cfg=None,
@@ -141,7 +303,11 @@ class ICFusionHead(BaseModule):
         self.LID = LID
         self.with_multiview = with_multiview
         self.query_3dpe = query_3dpe
+        self.lidar_3d_pe = lidar_3d_pe
         self.positional_encoding = positional_encoding #for multiview pe
+
+        self.use_separate_head = use_separate_head
+        self.separate_head = separate_head
 
         self.downsample_scale = downsample_scale #
         # dn config
@@ -160,6 +326,11 @@ class ICFusionHead(BaseModule):
         self.generate_with_pe = generate_with_pe
         self.query_generator = query_generator
         self.bbox_roi_extractor = bbox_roi_extractor
+
+        self.if_3d_prior = if_3d_prior
+        self.heatmap_layer = heatmap_layer
+        self.max_foreground_token = max_foreground_token
+        self.num_3d_proposals = num_3d_proposals
         self.loss_cls = build_loss(loss_cls)
         self.loss_bbox = build_loss(loss_bbox)
         self.loss_heatmap = build_loss(loss_heatmap)
@@ -184,29 +355,43 @@ class ICFusionHead(BaseModule):
                 norm_cfg=dict(type="BN2d")
             )
 
-            self.bev_2d_embedding = nn.Sequential(
-                nn.Linear(hidden_dim * 2, hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(hidden_dim, hidden_dim)
-            ) # 用于对BEV位置信息进行编码(主要对Lidar栅格进行编码)
-  
+            if not self.lidar_3d_pe and self.query_3dpe:
+                self.bev_2d_embedding = nn.Sequential(
+                    nn.Linear(hidden_dim * 2, hidden_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(hidden_dim, hidden_dim)
+                ) # 用于对BEV位置信息进行编码(主要对Lidar栅格进行编码)
+            
+            if self.lidar_3d_pe and not self.query_3dpe:
+                self.bev_3d_embedding = nn.Sequential(
+                    nn.Linear(hidden_dim * 3 // 2, hidden_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(hidden_dim, hidden_dim)
+                ) 
+
         # transformer
         self.num_pred = transformer.decoder.num_layers
         self.transformer = build_transformer(transformer)
         self.reference_points = nn.Embedding(num_query, 3)
-        
+
         if self.query_3dpe:
             self.bev_3d_embedding = nn.Sequential(
                 nn.Linear(hidden_dim * 3 // 2, hidden_dim),
                 nn.ReLU(inplace=True),
                 nn.Linear(hidden_dim, hidden_dim)
-            ) # 用于对BEV位置信息进行编码(主要对3D的参考点进行位置编码，当share_pe时，也用于编码图像特征点)
+            ) 
+        else:
+            self.bev_2d_embedding = nn.Sequential(
+                    nn.Linear(hidden_dim * 2, hidden_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(hidden_dim, hidden_dim)
+                ) 
 
         if input_modality['use_camera']: 
             self.input_proj = Conv2d(
                 self.hidden_dim, self.hidden_dim, kernel_size=1)
             
-            if self.if_depth_pe and not share_pe:
+            if self.if_depth_pe and (not share_pe or not self.query_3dpe):
                 self.bev_depth_embedding = nn.Sequential(
                     nn.Linear(hidden_dim * 3 // 2, hidden_dim),
                     nn.ReLU(inplace=True),
@@ -224,7 +409,7 @@ class ICFusionHead(BaseModule):
             sampler_cfg = dict(type='PseudoSampler')
             self.sampler = build_sampler(sampler_cfg, context=self)
         self._init_layers()
-    
+
     def _init_layers(self):
 
         if self.with_multiview:
@@ -236,26 +421,30 @@ class ICFusionHead(BaseModule):
             self.positional_encoding = build_positional_encoding(
                 self.positional_encoding)
 
-        cls_branch = []
-        for _ in range(self.num_reg_fcs):
-            cls_branch.append(Linear(self.hidden_dim, self.hidden_dim))
-            cls_branch.append(nn.LayerNorm(self.hidden_dim))
-            cls_branch.append(nn.ReLU(inplace=True))
-        cls_branch.append(Linear(self.hidden_dim, self.cls_out_channels))
-        fc_cls = nn.Sequential(*cls_branch)
+        if not self.use_separate_head:
+            cls_branch = []
+            for _ in range(self.num_reg_fcs):
+                cls_branch.append(Linear(self.hidden_dim, self.hidden_dim))
+                cls_branch.append(nn.LayerNorm(self.hidden_dim))
+                cls_branch.append(nn.ReLU(inplace=True))
+            cls_branch.append(Linear(self.hidden_dim, self.cls_out_channels))
+            fc_cls = nn.Sequential(*cls_branch)
 
-        reg_branch = []
-        for _ in range(self.num_reg_fcs):
-            reg_branch.append(Linear(self.hidden_dim, self.hidden_dim))
-            reg_branch.append(nn.ReLU())
-        reg_branch.append(Linear(self.hidden_dim, self.code_size))
-        reg_branch = nn.Sequential(*reg_branch)
+            reg_branch = []
+            for _ in range(self.num_reg_fcs):
+                reg_branch.append(Linear(self.hidden_dim, self.hidden_dim))
+                reg_branch.append(nn.ReLU())
+            reg_branch.append(Linear(self.hidden_dim, self.code_size))
+            reg_branch = nn.Sequential(*reg_branch)
 
-        self.cls_branches = nn.ModuleList(
-            [fc_cls for _ in range(self.num_pred)])
-        self.reg_branches = nn.ModuleList(
-            [reg_branch for _ in range(self.num_pred)])
-        
+            self.cls_branches = nn.ModuleList(
+                [fc_cls for _ in range(self.num_pred)])
+            self.reg_branches = nn.ModuleList(
+                [reg_branch for _ in range(self.num_pred)])
+
+        else:
+            self.separate_head = builder.build_head(self.separate_head)
+
         if self.if_2d_prior:
             assert self.query_generator is not None and self.bbox_roi_extractor is not None
             self.roi_size = self.bbox_roi_extractor['roi_layer']['output_size']
@@ -266,15 +455,38 @@ class ICFusionHead(BaseModule):
             if hasattr(self.bbox_roi_extractor, 'fp16_enabled'):
                 del self.bbox_roi_extractor.fp16_enabled
 
+        if self.if_3d_prior:
+            self.maxpool_2d = nn.MaxPool2d(kernel_size=3, stride=1, padding=1)
+            self.maxpool_2d_small = nn.MaxPool2d(kernel_size=1, stride=1, padding=0)
+
+            num_conv = self.heatmap_layer['num_conv']
+            proposal_head_kernel = self.heatmap_layer['proposal_head_kernel']
+            fc_list = []
+            fc_list = []
+            for _ in range(num_conv - 1):
+                fc_list.append(
+                    nn.Sequential(
+                        nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=proposal_head_kernel, padding=proposal_head_kernel//2, bias=False),
+                        nn.BatchNorm2d(self.hidden_dim, eps=1e-3, momentum=0.01),
+                        nn.ReLU(inplace=True)
+                    )
+                )
+            fc_list.append(
+                nn.Conv2d(self.hidden_dim, self.num_classes, kernel_size=1, stride=1, padding=0, bias=True)
+            )
+            self.heatmap_layer = nn.Sequential(*fc_list)
+            # 初始化偏置
+            self.heatmap_layer[-1].bias.data.fill_(-2.19)
 
     def init_weights(self):
         # super(ICFusionHead, self).init_weights()
         self.transformer.init_weights()
         nn.init.uniform_(self.reference_points.weight.data, 0, 1)
-        if self.loss_cls.use_sigmoid:
-            bias_init = bias_init_with_prob(0.01)
-            for m in self.cls_branches:
-                nn.init.constant_(m[-1].bias, bias_init)
+        if not self.use_separate_head:
+            if self.loss_cls.use_sigmoid:
+                bias_init = bias_init_with_prob(0.01)
+                for m in self.cls_branches:
+                    nn.init.constant_(m[-1].bias, bias_init)
 
     @property
     def coords_bev(self):
@@ -289,6 +501,8 @@ class ICFusionHead(BaseModule):
         batch_y = (batch_y + 0.5) / y_size
         coord_base = torch.cat([batch_x[None], batch_y[None]], dim=0)
         coord_base = coord_base.view(2, -1).transpose(1, 0) # (H*W, 2)
+        if self.lidar_3d_pe:
+            coord_base = torch.cat([coord_base, torch.ones_like(coord_base[:, 0:1])*0.5], dim=1)
         return coord_base
 
     def prepare_for_dn(self, batch_size, reference_points, img_metas):
@@ -306,7 +520,7 @@ class ICFusionHead(BaseModule):
             known_indice = torch.nonzero(unmask_label + unmask_bbox)
             known_indice = known_indice.view(-1)
             # add noise
-            groups = min(self.scalar, self.num_query // max(known_num))
+            groups = min(self.scalar, len(reference_points[0]) // max(known_num))
             known_indice = known_indice.repeat(groups, 1).view(-1)
             known_labels = labels.repeat(groups, 1).view(-1).long().to(reference_points.device)
             known_labels_raw = labels.repeat(groups, 1).view(-1).long().to(reference_points.device)
@@ -314,7 +528,7 @@ class ICFusionHead(BaseModule):
             known_bboxs = boxes.repeat(groups, 1).to(reference_points.device)
             known_bbox_center = known_bboxs[:, :3].clone()
             known_bbox_scale = known_bboxs[:, 3:6].clone()
-            
+
             if self.bbox_noise_scale > 0:
                 diff = known_bbox_scale / 2 + self.bbox_noise_trans
                 rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0
@@ -329,8 +543,8 @@ class ICFusionHead(BaseModule):
 
             single_pad = int(max(known_num))
             pad_size = int(single_pad * groups)
-            padding_bbox = torch.zeros(pad_size, 3).to(reference_points.device)
-            padded_reference_points = torch.cat([padding_bbox, reference_points], dim=0).unsqueeze(0).repeat(batch_size, 1, 1)
+            padding_bbox = torch.zeros(batch_size, pad_size, 3).to(reference_points.device)
+            padded_reference_points = torch.cat([padding_bbox, reference_points], dim=1)
 
             if len(known_num):
                 map_known_indice = torch.cat([torch.tensor(range(num)) for num in known_num])  # [1,2, 1,2,3]
@@ -338,7 +552,7 @@ class ICFusionHead(BaseModule):
             if len(known_bid):
                 padded_reference_points[(known_bid.long(), map_known_indice)] = known_bbox_center.to(reference_points.device)
 
-            tgt_size = pad_size + len(reference_points) 
+            tgt_size = pad_size + len(reference_points[0])
             attn_mask = torch.ones(tgt_size, tgt_size).to(reference_points.device) < 0
             # match query cannot see the reconstruct
             attn_mask[pad_size:, :pad_size] = True
@@ -361,9 +575,9 @@ class ICFusionHead(BaseModule):
                 'know_idx': know_idx,
                 'pad_size': pad_size
             }
-            
+
         else:
-            padded_reference_points = reference_points.unsqueeze(0).repeat(batch_size, 1, 1)
+            padded_reference_points = reference_points
             attn_mask = None
             mask_dict = None
 
@@ -416,14 +630,9 @@ class ICFusionHead(BaseModule):
         """
         eps = 1e-5
         depth_map_list = []
-        # depth_map_mask_list = []
         for meta in img_metas:
             depth_map_list.append(torch.tensor(meta['depth_map'], device=img_feats.device, dtype=torch.float32))
-            # depth_map_mask_list.append(torch.tensor(meta['depth_map_mask'],device=img_feats.device, dtype=torch.bool))
-        
         depth_map = torch.stack(depth_map_list, dim=0)
-        # depth_map_mask = torch.stack(depth_map_mask_list, dim=0)
-        # depth_map[~depth_map_mask] = eps
 
         BN, C, H, W = img_feats.shape
         pad_h, pad_w, _ = img_metas[0]['pad_shape'][0]
@@ -452,8 +661,8 @@ class ICFusionHead(BaseModule):
                         / (coords_3d.new_tensor(self.position_range[3:]) - coords_3d.new_tensor(self.position_range[:3]))[None, None, None, :]
         
         coords_3d = inverse_sigmoid(coords_3d)
-        if self.share_pe:
-            return self.bev_embedding(pos2emb3d(coords_3d, num_pos_feats=self.hidden_dim//2))
+        if self.share_pe and self.query_3dpe:
+            return self.bev_3d_embedding(pos2emb3d(coords_3d, num_pos_feats=self.hidden_dim//2))
         else:
             assert self.bev_depth_embedding is not None, "bev_depth_embedding is None"
             return self.bev_depth_embedding(pos2emb3d(coords_3d, num_pos_feats=self.hidden_dim//2))
@@ -483,8 +692,8 @@ class ICFusionHead(BaseModule):
                     img_meta_per_img[key] = img_meta[key][i]
                 img_metas.append(img_meta_per_img)
         intrinsics, extrinsics = self.get_box_params(proposals,
-                                                     [img_meta['lidar2cam'] for img_meta in img_metas],
-                                                     [img_meta['cam_intrinsic'] for img_meta in img_metas])
+                                                     [img_meta['cam_intrinsic'] for img_meta in img_metas],
+                                                     [img_meta['lidar2cam'] for img_meta in img_metas],)
         bbox_feats = self.bbox_roi_extractor([x_img], rois)
         
         # intrinsics as extra input feature
@@ -504,7 +713,59 @@ class ICFusionHead(BaseModule):
         reference_points = torch.cat([reference_points_proposal, reference_points], dim=0)
 
         return reference_points
-    
+
+    def generate_3d_reference_points(self, x, x_pos_embeds, reference_points, bs):
+
+        device, dtype = x.device, x.dtype
+        x_feature = x.clone()  # [B, C, H, W]
+        B, C, H, W = x_feature.shape
+        
+        heatmap = self.heatmap_layer(x)  # [B, num_classes, H, W]
+        heatmap_clone = heatmap.clone().detach()  # [B, num_classes, H, W]
+
+        x_hm_max = self.maxpool_2d(heatmap_clone)  # [B, num_classes, H, W]
+        x_hm_max_small = self.maxpool_2d_small(heatmap_clone)  # [B, num_classes, H, W]
+
+        selected = (x_hm_max == heatmap_clone)  # [B, num_classes, H, W]
+        selected_small = (x_hm_max_small == heatmap_clone)  # [B, num_classes, H, W]
+
+        selected[:, 8:10, :, :] = selected_small[:, 8:10, :, :]
+
+        score = heatmap_clone * selected  # [B, num_classes, H, W]
+        score, _ = score.topk(1, dim=1)  # [B, 1, H, W]
+
+        proposal_list = []
+        foreground_feature = torch.zeros(bs, self.max_foreground_token, self.hidden_dim, device=device, dtype=dtype)
+        foreground_bevemb = torch.zeros(bs, self.max_foreground_token, self.hidden_dim, device=device, dtype=dtype)
+
+        for i in range(bs):
+            # 对每个批次，找到顶级提案
+            sample_hm = score[i].squeeze(0).view(-1)  # [H*W]
+            sample_x_feature = x_feature[i].view(C, -1)  # [C, H*W]
+        
+            _, proposal_ind = sample_hm.topk(self.num_3d_proposals) # 推荐区域ID
+            _, voxel_ind = sample_hm.topk(self.max_foreground_token) # 前景体素ID
+
+            selected_pos = self.coords_bev[proposal_ind].unsqueeze(0).to(device)  # [1, num_3d_proposals, 2]
+            selected_features = sample_x_feature[:, voxel_ind]  # [C, max_foreground_token]
+            selected_bevemb = x_pos_embeds[voxel_ind]  # [max_foreground_token, C]
+
+            foreground_feature[i, :, :] = selected_features.t()
+            foreground_bevemb[i, :, :] = selected_bevemb
+
+            proposal_list.append(selected_pos)
+        
+        query_pos = torch.cat(proposal_list, dim=0)# 形状：[batch_size, num_3d_proposals, 2]
+        init_reference_points = torch.cat([
+            query_pos,
+            torch.full((*query_pos.shape[:-1], 1), 0.5, device=query_pos.device)
+        ], dim=-1)  # 形状：[batch_size, num_3d_proposals, 3]
+
+        reference_points = reference_points.unsqueeze(0).repeat(bs,1,1)
+        reference_points = torch.cat([init_reference_points, reference_points],dim=1)
+
+        return reference_points, foreground_feature, foreground_bevemb, heatmap
+
     @torch.no_grad()
     def get_box_params(self, bboxes, intrinsics, extrinsics):
         # TODO: check grad flow from boxes to intrinsic
@@ -528,19 +789,48 @@ class ICFusionHead(BaseModule):
         extrinsic_list = torch.cat(extrinsic_list, 0)
         return intrinsic_list, extrinsic_list    
 
+    def visualize_ref_points(self, reference_points, img_metas):
+        import matplotlib.pyplot as plt
+        import time
+
+        # 提取 x 和 y 坐标
+        x_coords = reference_points[:, 0].cpu().detach().numpy() * (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0]
+        y_coords = reference_points[:, 1].cpu().detach().numpy() * (self.pc_range[4] - self.pc_range[1]) + self.pc_range[1]
+
+        x_coords_gt = img_metas[0]['gt_bboxes_3d']._data.gravity_center[:, 0].cpu().detach().numpy()
+        y_coords_gt = img_metas[0]['gt_bboxes_3d']._data.gravity_center[:, 1].cpu().detach().numpy()
+
+        # 创建一个散点图 (scatter plot) 进行 BEV 可视化
+        plt.figure(figsize=(8, 8), dpi=100)
+        
+        # 绘制参考点（蓝色）
+        plt.scatter(x_coords, y_coords, c='blue', s=20, marker='.', alpha=0.7, label='Reference Points')
+        
+        # 绘制真实目标重心（红色）
+        plt.scatter(x_coords_gt, y_coords_gt, c='red', s=30, marker='o', alpha=0.6, label='Ground Truth')
+
+        # 去掉坐标轴和网格
+        plt.axis('off')
+
+        # 设置坐标轴比例相等
+        plt.gca().set_aspect('equal', adjustable='box')
+
+        plt.gca().set_xlim(self.pc_range[0], self.pc_range[3])
+        plt.gca().set_ylim(self.pc_range[1], self.pc_range[4])
+
+        # # 添加图例
+        # plt.legend(loc='upper right', fontsize=12)
+
+        # 保存图像，防止覆盖文件名，添加时间戳
+        timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
+        plt.savefig(f'bev_visualization_{timestamp}.png', format='png', bbox_inches='tight', pad_inches=0)
+
     def forward_single(self, x, x_img, img_metas, proposals=None):
         """
             x: [bs c h w]
             return List(dict(head_name: [num_dec x bs x num_query * head_dim]) ) x task_num
         """
-        if self.input_modality['use_lidar']:
-            assert x is not None
-            x = self.shared_conv(x)
-            # point_features_pe
-            bev_pos_embeds = self.bev_2d_embedding(pos2embed(self.coords_bev.to(x.device), num_pos_feats=self.hidden_dim))
-            bs = x.size(0)
-        else:
-            bev_pos_embeds = None
+        reference_points = self.reference_points.weight # N * 3
 
         if self.input_modality['use_camera']:
             assert x_img is not None
@@ -569,18 +859,41 @@ class ICFusionHead(BaseModule):
                 sin_embed = self.positional_encoding(masks)
                 sin_embed = self.adapt_pos3d(sin_embed.flatten(0, 1)).view(x_img.size()).permute(0, 2, 3, 1)
                 rv_pos_embeds = rv_pos_embeds + sin_embed
+
+            if proposals is not None and self.if_2d_prior:
+                if self.generate_with_pe:
+                    reference_points = self.generate_reference_points(x_img + rv_pos_embeds.permute(0, 3, 1, 2), proposals, reference_points, img_metas)
+                else:
+                    reference_points = self.generate_reference_points(x_img, proposals, reference_points, img_metas)
         else:
             rv_pos_embeds = None
-        
-        reference_points = self.reference_points.weight
-        if proposals is not None and self.if_2d_prior:
-            if self.generate_with_pe:
-                reference_points = self.generate_reference_points(x_img + rv_pos_embeds.permute(0, 3, 1, 2), proposals, reference_points, img_metas)
+
+        if self.input_modality['use_lidar']:
+            assert x is not None
+            heatmap = None
+            x = self.shared_conv(x)
+
+            # point_features_pe
+            if not self.lidar_3d_pe:
+                bev_pos_embeds = self.bev_2d_embedding(pos2embed(self.coords_bev.to(x.device), num_pos_feats=self.hidden_dim))
             else:
-                reference_points = self.generate_reference_points(x_img, proposals, reference_points, img_metas)
+                bev_pos_embeds = self.bev_3d_embedding(pos2emb3d(self.coords_bev.to(x.device)))
+            bs = x.size(0)
+            if self.if_3d_prior:
+                reference_points, x, bev_pos_embeds, heatmap = self.generate_3d_reference_points(x, bev_pos_embeds, reference_points, bs)
+            else:
+                x = rearrange(x, "b c h w -> b (h w) c")
+                bev_pos_embeds = bev_pos_embeds.unsqueeze(0).repeat(bs, 1, 1)
+        else:
+            bev_pos_embeds = None
+
+        if False:
+            self.visualize_ref_points(reference_points, img_metas)
+            
+        if len(reference_points.shape) == 2:
+            reference_points = reference_points.unsqueeze(0).repeat(bs, 1, 1)
 
         reference_points, attn_mask, mask_dict = self.prepare_for_dn(bs, reference_points, img_metas)
-        # query_pe
         query_embeds = self.query_embed(reference_points, img_metas)
 
         outs_dec, _, attn_weights = self.transformer(
@@ -594,28 +907,43 @@ class ICFusionHead(BaseModule):
         outputs_classes = []
         outputs_coords = []
         reference = inverse_sigmoid(reference_points.clone())
-        
-        for lvl in range(outs_dec.shape[0]):
-            reference = inverse_sigmoid(reference_points.clone())
-            assert reference.shape[-1] == 3
-            outputs_class = self.cls_branches[lvl](outs_dec[lvl])
-            tmp = self.reg_branches[lvl](outs_dec[lvl])
 
-            tmp[..., 0:2] += reference[..., 0:2]
-            tmp[..., 0:2] = tmp[..., 0:2].sigmoid()
-            tmp[..., 4:5] += reference[..., 2:3]
-            tmp[..., 4:5] = tmp[..., 4:5].sigmoid()
+        if not self.use_separate_head:
+            for lvl in range(outs_dec.shape[0]):
+                assert reference.shape[-1] == 3
+                outputs_class = self.cls_branches[lvl](outs_dec[lvl])
+                tmp = self.reg_branches[lvl](outs_dec[lvl])
 
-            outputs_coord = tmp
-            outputs_classes.append(outputs_class)
-            outputs_coords.append(outputs_coord)
+                tmp[..., 0:2] += reference[..., 0:2]
+                tmp[..., 0:2] = tmp[..., 0:2].sigmoid()
+                tmp[..., 4:5] += reference[..., 2:3]
+                tmp[..., 4:5] = tmp[..., 4:5].sigmoid()
 
-        all_cls_scores = torch.stack(outputs_classes)
-        all_bbox_preds = torch.stack(outputs_coords)
+                outputs_coord = tmp
+                outputs_classes.append(outputs_class)
+                outputs_coords.append(outputs_coord)
 
-        all_bbox_preds[..., 0:1] = (all_bbox_preds[..., 0:1] * (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0])
-        all_bbox_preds[..., 1:2] = (all_bbox_preds[..., 1:2] * (self.pc_range[4] - self.pc_range[1]) + self.pc_range[1])
-        all_bbox_preds[..., 4:5] = (all_bbox_preds[..., 4:5] * (self.pc_range[5] - self.pc_range[2]) + self.pc_range[2])
+            all_cls_scores = torch.stack(outputs_classes)
+            all_bbox_preds = torch.stack(outputs_coords)
+
+            all_bbox_preds[..., 0:1] = (all_bbox_preds[..., 0:1] * (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0])
+            all_bbox_preds[..., 1:2] = (all_bbox_preds[..., 1:2] * (self.pc_range[4] - self.pc_range[1]) + self.pc_range[1])
+            all_bbox_preds[..., 4:5] = (all_bbox_preds[..., 4:5] * (self.pc_range[5] - self.pc_range[2]) + self.pc_range[2])
+
+        else:
+            outs = self.separate_head(outs_dec)
+            center = (outs['center'] + reference[None, :, :, :2]).sigmoid()
+            height = (outs['height'] + reference[None, :, :, 2:3]).sigmoid()
+            _center, _height = center.new_zeros(center.shape), height.new_zeros(height.shape)
+            _center[..., 0:1] = center[..., 0:1] * (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0]
+            _center[..., 1:2] = center[..., 1:2] * (self.pc_range[4] - self.pc_range[1]) + self.pc_range[1]
+            _height[..., 0:1] = height[..., 0:1] * (self.pc_range[5] - self.pc_range[2]) + self.pc_range[2]
+            dim = outs['dim']
+            rot = outs['rot']
+            vel = outs['vel']
+
+            all_cls_scores = outs['cls_logits']
+            all_bbox_preds = torch.cat([_center, dim[..., :2], _height, dim[..., 2:3], rot, vel], dim=-1)
 
         if mask_dict and mask_dict['pad_size'] > 0:
             output_known_class = all_cls_scores[:, :, :mask_dict['pad_size'], :]
@@ -636,6 +964,10 @@ class ICFusionHead(BaseModule):
             }
 
         outs['attn_weights'] = attn_weights
+
+        if self.input_modality['use_lidar']:
+            outs['heatmap'] = heatmap
+
         return outs
 
     def forward(self, pts_feats, img_feats=None, img_metas=None, proposals=None):
@@ -906,7 +1238,95 @@ class ICFusionHead(BaseModule):
                 loss_dict[f'd{num_dec_layer}.dn_loss_cls'] = loss_cls_i
                 loss_dict[f'd{num_dec_layer}.dn_loss_bbox'] = loss_bbox_i
                 num_dec_layer += 1
+        if preds_dicts.get("heatmap", None) is not None:
+            heatmap_pred = preds_dicts['heatmap']
+            hp_target = []
+            for i in range(len(gt_bboxes_3d)):
+                heatmap_target = self.get_heatmap_target_single(
+                    gt_bboxes_3d[i],
+                    gt_labels_3d[i],
+                    heatmap_pred.shape[-2:]
+                )
+                hp_target.append(heatmap_target)
+            hp_target = torch.stack(hp_target, dim=0)
+            loss_heatmap = self.loss_heatmap(clip_sigmoid(heatmap_pred), hp_target, avg_factor=max(hp_target.eq(1).float().sum().item(), 1))
+            loss_dict['loss_heatmap'] = loss_heatmap
+
         return loss_dict
+
+    def get_heatmap_target_single(self, gt_bboxes_3d, gt_labels_3d, feature_map_size):
+        
+        num_max_objs = 500
+        gaussian_overlap = 0.1
+        min_radius = 2
+
+        pc_range = torch.tensor(self.train_cfg['point_cloud_range'])
+        voxel_size = torch.tensor(self.train_cfg['voxel_size'])
+        H, W = feature_map_size
+
+        gt_bboxes_3d = gt_bboxes_3d[:, :6]
+
+        heatmap = gt_bboxes_3d.new_zeros((self.num_classes, H, W))
+
+        x, y= gt_bboxes_3d[:, 0], gt_bboxes_3d[:, 1]
+        dx, dy = gt_bboxes_3d[:, 3], gt_bboxes_3d[:, 4]
+
+        coord_x = (x - pc_range[0]) / voxel_size[0] / self.downsample_scale
+        coord_y = (y - pc_range[1]) / voxel_size[1] / self.downsample_scale
+        coord_x = torch.clamp(coord_x, min=0, max=W - 0.5)  
+        coord_y = torch.clamp(coord_y, min=0, max=H - 0.5) 
+
+        center = torch.stack([coord_y, coord_x], dim=1)  # [num_gt, 2]
+        center_int = center.int()
+
+        dx = dx / voxel_size[0] / self.downsample_scale
+        dy = dy / voxel_size[1] / self.downsample_scale
+
+        radius = gaussian_radius((dx, dy), min_overlap=gaussian_overlap)
+        radius = torch.clamp_min(radius.int(), min=min_radius)
+
+        for k in range(min(num_max_objs, gt_bboxes_3d.shape[0])):
+            if dx[k] <= 0 or dy[k] <= 0:
+                continue
+
+            if not (0 <= center_int[k][0] <= H and 0 <= center_int[k][1] <= W):
+                continue
+
+            cur_class_id = (gt_labels_3d[k]).long()
+
+            heatmap[cur_class_id] = self.draw_gaussian_heatmap(
+                heatmap[cur_class_id], center[k], radius[k].item()
+            )
+
+        return heatmap
+
+    def draw_gaussian_heatmap(self, heatmap, center, radius):
+
+        diameter = 2 * radius + 1
+        sigma = diameter / 6
+        x, y = map(int, center)
+        height, width = heatmap.shape
+
+        left, right = min(x, radius), min(width - x, radius + 1)
+        top, bottom = min(y, radius), min(height - y, radius + 1)
+
+        y1, y2 = y - top, y + bottom
+        x1, x2 = x - left, x + right
+
+        heatmap_slice = heatmap[y1:y2, x1:x2]
+
+        # 生成高斯核
+        x_range = torch.arange(-left, right, dtype=heatmap.dtype, device=heatmap.device)
+        y_range = torch.arange(-top, bottom, dtype=heatmap.dtype, device=heatmap.device)
+        y_cor, x_cor = torch.meshgrid(y_range, x_range)  # 明确指定索引方式
+
+        gaussian = torch.exp(-(x_cor**2 + y_cor**2) / (2 * sigma ** 2))
+
+        # 将高斯核与热图切片取最大值
+        torch.max(heatmap_slice, gaussian, out=heatmap_slice)
+
+        return heatmap
+    
 
     @force_fp32(apply_to=('preds_dicts'))
     def get_bboxes(self, preds_dicts, img_metas, img=None, rescale=False):

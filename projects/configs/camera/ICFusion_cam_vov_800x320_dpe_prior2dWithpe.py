@@ -164,7 +164,8 @@ model = dict(
         bg_cls_weight=0, #背景类的权重
         if_depth_pe=True, # 是否对图像进行深度位置编码
         share_pe=False, # 只有在if_depth_pe为True时，该参数才有效，是否和query共享深度位置编码
-        generate_with_pe=False, # 是否使用位置编码生成query,需要配合if_2d_prior=True使用
+        generate_with_pe=True, # 是否使用位置编码生成query,需要配合if_2d_prior=True使用
+        query_3dpe=True,
         downsample_scale=8,
         position_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
         normedlinear=False,
@@ -453,6 +454,3 @@ gpu_ids = range(0, 8)
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
 load_from='ckpts/camera_vov_800x320_2d_pretrain.pth'
 resume_from=None
-
-
-
