@@ -16,7 +16,95 @@ from mmdet.datasets.builder import PIPELINES
 from mmdet.datasets.pipelines import RandomFlip
 from mmdet3d.core.bbox import box_np_ops
 from mmdet3d.datasets.builder import OBJECTSAMPLERS
+from PIL import Image
+from mmdet3d.datasets.pipelines.transforms_3d import ObjectRangeFilter, ObjectNameFilter
+from mmdet3d.core.bbox import (CameraInstance3DBoxes, DepthInstance3DBoxes,
+                               LiDARInstance3DBoxes, box_np_ops)
 
+@PIPELINES.register_module()
+class CustomObjectRangeFilter(ObjectRangeFilter):
+    def __init__(self, with_bbox_2d=False, **kwargs):
+        super(CustomObjectRangeFilter, self).__init__(**kwargs)
+        self.with_bbox_2d = with_bbox_2d
+
+    def __call__(self, input_dict):
+        if isinstance(input_dict['gt_bboxes_3d'],
+                      (LiDARInstance3DBoxes, DepthInstance3DBoxes)):
+            bev_range = self.pcd_range[[0, 1, 3, 4]]
+        elif isinstance(input_dict['gt_bboxes_3d'], CameraInstance3DBoxes):
+            bev_range = self.pcd_range[[0, 2, 3, 5]]
+
+        gt_bboxes_3d = input_dict['gt_bboxes_3d']
+        gt_labels_3d = input_dict['gt_labels_3d']
+        mask = gt_bboxes_3d.in_range_bev(bev_range)
+        gt_bboxes_3d = gt_bboxes_3d[mask]
+        # mask is a torch tensor but gt_labels_3d is still numpy array
+        # using mask to index gt_labels_3d will cause bug when
+        # len(gt_labels_3d) == 1, where mask=1 will be interpreted
+        # as gt_labels_3d[1] and cause out of index error
+        mask_numpy = mask.numpy().astype(np.bool)
+        gt_labels_3d = gt_labels_3d[mask_numpy]
+
+        # 2d bboxes to 3d bboxes mapping: -1 for not matched to any 3d bbox
+        if self.with_bbox_2d:
+            gt_ids = np.zeros(len(mask_numpy), dtype=np.int32)
+            gt_ids[mask_numpy] = np.arange(len(gt_labels_3d))
+            gt_ids[~mask_numpy] = -1
+            gt_bboxes_2d_to_3d = input_dict['gt_bboxes_2d_to_3d']
+            # assert all([(mapping > -1).all() for mapping in gt_bboxes_2d_to_3d])
+            gt_bboxes_2d_to_3d_filtered = []
+            for bboxes_2d_to_3d in gt_bboxes_2d_to_3d:
+                bboxes_2d_to_3d[bboxes_2d_to_3d > -1] = gt_ids[bboxes_2d_to_3d[bboxes_2d_to_3d > -1]]
+                gt_bboxes_2d_to_3d_filtered.append(bboxes_2d_to_3d)
+            input_dict['gt_bboxes_2d_to_3d'] = gt_bboxes_2d_to_3d_filtered
+
+        # limit rad to [-pi, pi]
+        gt_bboxes_3d.limit_yaw(offset=0.5, period=2 * np.pi)
+        input_dict['gt_bboxes_3d'] = gt_bboxes_3d
+        input_dict['gt_labels_3d'] = gt_labels_3d
+
+        return input_dict
+
+
+@PIPELINES.register_module()
+class CustomObjectNameFilter(ObjectNameFilter):
+    def __init__(self, with_bbox_2d=False, **kwargs):
+        super(CustomObjectNameFilter, self).__init__(**kwargs)
+        self.with_bbox_2d = with_bbox_2d
+
+    def __call__(self, input_dict):
+        gt_labels_3d = input_dict['gt_labels_3d']
+        gt_bboxes_mask = np.array([n in self.labels for n in gt_labels_3d],
+                                  dtype=np.bool_)
+        input_dict['gt_bboxes_3d'] = input_dict['gt_bboxes_3d'][gt_bboxes_mask]
+        input_dict['gt_labels_3d'] = input_dict['gt_labels_3d'][gt_bboxes_mask]
+
+        # remove corresponding 2d bboxes
+        if self.with_bbox_2d:
+            gt_ids = np.zeros(len(gt_bboxes_mask), dtype=np.int32)
+            gt_ids[gt_bboxes_mask] = np.arange(len(input_dict['gt_labels_3d']))
+            gt_ids[~gt_bboxes_mask] = -1
+            gt_bboxes_2d = input_dict['gt_bboxes_2d']
+            gt_labels_2d = input_dict['gt_labels_2d']
+            gt_bboxes_2d_to_3d = input_dict['gt_bboxes_2d_to_3d']
+            gt_bboxes_2d_filtered = []
+            gt_labels_2d_filtered = []
+            gt_bboxes_2d_to_3d_filtered = []
+            for bboxes_2d, labels_2d, bboxes_2d_to_3d in zip(gt_bboxes_2d, gt_labels_2d, gt_bboxes_2d_to_3d):
+                # 1. filter out 2d bboxes
+                mask_2d = np.array([n in self.labels for n in labels_2d], dtype=np.bool_)
+                gt_bboxes_2d_filtered.append(bboxes_2d[mask_2d])
+                gt_labels_2d_filtered.append(labels_2d[mask_2d])
+                bboxes_2d_to_3d_filtered = bboxes_2d_to_3d[mask_2d]
+                # 2. adjust mapping
+                bboxes_2d_to_3d_filtered[bboxes_2d_to_3d_filtered > -1] = \
+                    gt_ids[bboxes_2d_to_3d_filtered[bboxes_2d_to_3d_filtered > -1]]
+                gt_bboxes_2d_to_3d_filtered.append(bboxes_2d_to_3d_filtered)
+            input_dict['gt_bboxes_2d'] = gt_bboxes_2d_filtered
+            input_dict['gt_labels_2d'] = gt_labels_2d_filtered
+            input_dict['gt_bboxes_2d_to_3d'] = gt_bboxes_2d_to_3d_filtered
+
+        return input_dict
 
 @PIPELINES.register_module()
 class PadMultiViewImage(object):
@@ -340,17 +428,13 @@ class ResizeCropFlipImage(object):
         new_depths = []
         resize, resize_dims, crop, flip, rotate = self._sample_augmentation()
         for i in range(N):
-            post_rot = torch.eye(2)
-            post_tran = torch.zeros(2)
-            img = imgs[i]
+            img = Image.fromarray(np.uint8(imgs[i]))
 
             # augmentation (resize, crop, horizontal flip, rotate)
             if self.pic_wise:
                 resize, resize_dims, crop, flip, rotate = self._sample_augmentation()
-            img, post_rot2, post_tran2 = self._img_transform(
+            img, ida_mat = self._img_transform(
                 img,
-                post_rot,
-                post_tran,
                 resize=resize,
                 resize_dims=resize_dims,
                 crop=crop,
@@ -369,14 +453,91 @@ class ResizeCropFlipImage(object):
                 )
                 new_depths.append(depth.astype(np.float32))
 
-            new_imgs.append(img)
-            results['cam_intrinsic'][i][:2, :3] = post_rot2 @ results['cam_intrinsic'][i][:2, :3]
-            results['cam_intrinsic'][i][:2, 2] = post_tran2 + results['cam_intrinsic'][i][:2, 2]
+            new_imgs.append(np.array(img).astype(np.float32))
+            results['cam_intrinsic'][i][:3, :3] = ida_mat @ results['cam_intrinsic'][i][:3, :3]
 
         results["img"] = new_imgs
         results["depths"] = new_depths
         results['lidar2img'] = [results['cam_intrinsic'][i] @ results['lidar2cam'][i] for i in range(len(results['lidar2cam']))]
+        
+        if 'gt_bboxes_2d' in results.keys():
+            gt_bboxes_2d = results['gt_bboxes_2d']
+            gt_labels_2d = results['gt_labels_2d']
+            gt_bboxes_2d_to_3d = results['gt_bboxes_2d_to_3d']
+            gt_bboxes_ignore = results['gt_bboxes_ignore']
+            processed_gt_bboxes_2d = []
+            processed_gt_labels_2d = []
+            processed_gt_bboxes_2d_to_3d = []
+            processed_gt_bboxes_ignore = []
+            for i in range(N):
+                bboxes_2d = gt_bboxes_2d[i]
+                labels_2d = gt_labels_2d[i]
+                bboxes_2d_to_3d = gt_bboxes_2d_to_3d[i]
+                bboxes_ignore = gt_bboxes_ignore[i]
+                # 1. resize
+                bboxes_2d = bboxes_2d * resize
+                bboxes_ignore = bboxes_ignore * resize
+                # 2. crop and filter out-of-image bboxes
+                bboxes_2d[:, 0::2] = np.clip(bboxes_2d[:, 0::2], crop[0], crop[2])
+                bboxes_2d[:, 1::2] = np.clip(bboxes_2d[:, 1::2], crop[1], crop[3])
+                bboxes_2d[:, 0::2] = bboxes_2d[:, 0::2] - crop[0]
+                bboxes_2d[:, 1::2] = bboxes_2d[:, 1::2] - crop[1]
+                bboxes_area = (bboxes_2d[:, 2:] - bboxes_2d[:, :2]).prod(1)
+                valid_mask = bboxes_area > 64
+                bboxes_2d = bboxes_2d[valid_mask]
+                labels_2d = labels_2d[valid_mask]
+                bboxes_2d_to_3d = bboxes_2d_to_3d[valid_mask]
 
+                bboxes_ignore[:, 0::2] = np.clip(bboxes_ignore[:, 0::2], crop[0], crop[2])
+                bboxes_ignore[:, 1::2] = np.clip(bboxes_ignore[:, 1::2], crop[1], crop[3])
+                bboxes_ignore[:, 0::2] = bboxes_ignore[:, 0::2] - crop[0]
+                bboxes_ignore[:, 1::2] = bboxes_ignore[:, 1::2] - crop[1]
+                bboxes_area = (bboxes_ignore[:, 2:] - bboxes_ignore[:, :2]).prod(1)
+                valid_mask = bboxes_area > 64
+                bboxes_ignore = bboxes_ignore[valid_mask]
+                # 3. flip
+                if flip:
+                    flipped_bboxes = bboxes_2d.copy()
+                    w = crop[2] - crop[0]
+                    flipped_bboxes[..., 0::4] = w - bboxes_2d[..., 2::4]
+                    flipped_bboxes[..., 2::4] = w - bboxes_2d[..., 0::4]
+                    bboxes_2d = flipped_bboxes
+
+                    flipped_bboxes = bboxes_ignore.copy()
+                    w = crop[2] - crop[0]
+                    flipped_bboxes[..., 0::4] = w - bboxes_ignore[..., 2::4]
+                    flipped_bboxes[..., 2::4] = w - bboxes_ignore[..., 0::4]
+                    bboxes_ignore = flipped_bboxes
+                # 4. rotate and filter out-of-image bboxes
+                A = self._get_rot(rotate / 180 * np.pi)
+                b = torch.Tensor([crop[2] - crop[0], crop[3] - crop[1]]) / 2
+                b = A.matmul(-b) + b
+                bbox_corners = np.stack([bboxes_2d[:, 0], bboxes_2d[:, 1], bboxes_2d[:, 0], bboxes_2d[:, 3],
+                                         bboxes_2d[:, 2], bboxes_2d[:, 3], bboxes_2d[:, 2], bboxes_2d[:, 1]], axis=1).reshape(-1, 4, 2)
+                bbox_corners = bbox_corners @ A.numpy().T + b.numpy()[None, None]
+                bboxes_2d = np.concatenate([bbox_corners.min(1), bbox_corners.max(1)], axis=1)
+                bboxes_2d[:, 0::2] = np.clip(bboxes_2d[:, 0::2], 0, crop[2] - crop[0])
+                bboxes_2d[:, 1::2] = np.clip(bboxes_2d[:, 1::2], 0, crop[3] - crop[1])
+                bboxes_area = (bboxes_2d[:, 2:] - bboxes_2d[:, :2]).prod(1)
+                valid_mask = bboxes_area > 64
+                bboxes_2d = bboxes_2d[valid_mask]
+                labels_2d = labels_2d[valid_mask]
+                bboxes_2d_to_3d = bboxes_2d_to_3d[valid_mask]
+
+                bbox_corners = np.stack([bboxes_ignore[:, 0], bboxes_ignore[:, 1], bboxes_ignore[:, 0], bboxes_ignore[:, 3],
+                                         bboxes_ignore[:, 2], bboxes_ignore[:, 3], bboxes_ignore[:, 2], bboxes_ignore[:, 1]], axis=1).reshape(-1, 4, 2)
+                bbox_corners = bbox_corners @ A.numpy().T + b.numpy()[None, None]
+                bboxes_ignore = np.concatenate([bbox_corners.min(1), bbox_corners.max(1)], axis=1)
+
+                processed_gt_bboxes_2d.append(bboxes_2d)
+                processed_gt_labels_2d.append(labels_2d)
+                processed_gt_bboxes_2d_to_3d.append(bboxes_2d_to_3d)
+                processed_gt_bboxes_ignore.append(bboxes_ignore)
+
+            results['gt_bboxes_2d'] = processed_gt_bboxes_2d
+            results['gt_labels_2d'] = processed_gt_labels_2d
+            results['gt_bboxes_2d_to_3d'] = processed_gt_bboxes_2d_to_3d
+            results['gt_bboxes_ignore'] = processed_gt_bboxes_ignore
         return results
 
     def _get_rot(self, h):
@@ -388,49 +549,33 @@ class ResizeCropFlipImage(object):
             ]
         )
 
-    def _img_transform(self, img, post_rot, post_tran, resize, resize_dims, crop, flip, rotate):
+    def _img_transform(self, img, resize, resize_dims, crop, flip, rotate):
+        ida_rot = torch.eye(2)
+        ida_tran = torch.zeros(2)
         # adjust image
-        resized_img = cv2.resize(img, resize_dims)
-        img = np.zeros((crop[3] - crop[1], crop[2] - crop[0], 3))
-        
-        hsize, wsize = crop[3] - crop[1], crop[2] - crop[0]
-        dh, dw, sh, sw = crop[1], crop[0], 0, 0
-        
-        if dh < 0:
-            sh = -dh
-            hsize += dh
-            dh = 0
-        if dh + hsize > resized_img.shape[0]:
-            hsize = resized_img.shape[0] - dh
-        if dw < 0:
-            sw = -dw
-            wsize += dw
-            dw = 0
-        if dw + wsize > resized_img.shape[1]:
-            wsize = resized_img.shape[1] - dw
-        img[sh : sh + hsize, sw : sw + wsize] = resized_img[dh: dh + hsize, dw: dw + wsize]
-        
-        (h, w) = img.shape[:2]
-        center = (w / 2, h / 2)
+        img = img.resize(resize_dims)
+        img = img.crop(crop)
         if flip:
-            img = cv2.flip(img, 1)
-        M = cv2.getRotationMatrix2D(center, rotate, scale=1.0)
-        img = cv2.warpAffine(img, M, (w, h))
+            img = img.transpose(method=Image.FLIP_LEFT_RIGHT)
+        img = img.rotate(rotate)
+
         # post-homography transformation
-        post_rot *= resize
-        post_tran -= torch.Tensor(crop[:2])
+        ida_rot *= resize
+        ida_tran -= torch.Tensor(crop[:2])
         if flip:
             A = torch.Tensor([[-1, 0], [0, 1]])
             b = torch.Tensor([crop[2] - crop[0], 0])
-            post_rot = A.matmul(post_rot)
-            post_tran = A.matmul(post_tran) + b
+            ida_rot = A.matmul(ida_rot)
+            ida_tran = A.matmul(ida_tran) + b
         A = self._get_rot(rotate / 180 * np.pi)
         b = torch.Tensor([crop[2] - crop[0], crop[3] - crop[1]]) / 2
         b = A.matmul(-b) + b
-        post_rot = A.matmul(post_rot)
-        post_tran = A.matmul(post_tran) + b
-
-        return img, post_rot, post_tran
+        ida_rot = A.matmul(ida_rot)
+        ida_tran = A.matmul(ida_tran) + b
+        ida_mat = torch.eye(3)
+        ida_mat[:2, :2] = ida_rot
+        ida_mat[:2, 2] = ida_tran
+        return img, ida_mat
 
     def _sample_augmentation(self):
         H, W = self.data_aug_conf["H"], self.data_aug_conf["W"]
@@ -894,14 +1039,14 @@ class GlobalRotScaleTransImage(object):
             dict: Updated result dict.
         """
         # random rotate
-        rot_angle = np.random.uniform(*self.rot_range)
+        rot_angle = np.random.uniform(*self.rot_range) # 我们采样得到一个角度
 
-        self.rotate_bev_along_z(results, rot_angle)
+        self.rotate_bev_along_z(results, rot_angle) # 实际是旋转了一个-rot_angle角度
         if self.reverse_angle:
             rot_angle *= -1
         results["gt_bboxes_3d"].rotate(
             np.array(rot_angle)
-        )  # mmdet LiDARInstance3DBoxes存的角度方向是反的(rotate函数实现的是绕着z轴由y向x转)
+        )  # mmdet LiDARInstance3DBoxes存的角度方向是反的(rotate函数实现的是绕着z轴由y向x转)(你说的对，但是在改动lidar2cam的时候，我们是按照rotate函数的方向来的，所以这里不用改)
 
         # random scale
         scale_ratio = np.random.uniform(*self.scale_ratio_range)
@@ -918,8 +1063,8 @@ class GlobalRotScaleTransImage(object):
         rot_cos = torch.cos(torch.tensor(angle))
         rot_sin = torch.sin(torch.tensor(angle))
 
-        rot_mat = torch.tensor([[rot_cos, -rot_sin, 0, 0], [rot_sin, rot_cos, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
-        rot_mat_inv = torch.inverse(rot_mat)
+        rot_mat = torch.tensor([[rot_cos, -rot_sin, 0, 0], [rot_sin, rot_cos, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]) # oldLiDAR2newLiDAR 但是旋转-θ角度
+        rot_mat_inv = torch.inverse(rot_mat) # newLiDAR2oldLiDAR
 
         num_view = len(results["lidar2img"])
         for view in range(num_view):
@@ -936,9 +1081,9 @@ class GlobalRotScaleTransImage(object):
                 [0, 0, scale_ratio, 0],
                 [0, 0, 0, 1],
             ]
-        )
+        ) # 所有的坐标扩大scale_ratio倍，原来的单位向量在新坐标系下的模为scale_ratio，所以这是oldLiDAR2newLiDAR
 
-        rot_mat_inv = torch.inverse(rot_mat)
+        rot_mat_inv = torch.inverse(rot_mat) # newLiDAR2oldLiDAR
 
         num_view = len(results["lidar2img"])
         for view in range(num_view):

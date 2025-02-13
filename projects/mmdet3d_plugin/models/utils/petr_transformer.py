@@ -34,6 +34,85 @@ from mmcv.utils import (
 from mmdet.models.utils.builder import TRANSFORMER
 
 
+@TRANSFORMER.register_module()
+class PETRTransformer(BaseModule):
+    """Implements the DETR transformer.
+    Following the official DETR implementation, this module copy-paste
+    from torch.nn.Transformer with modifications:
+        * positional encodings are passed in MultiheadAttention
+        * extra LN at the end of encoder is removed
+        * decoder returns a stack of activations from all decoding layers
+    See `paper: End-to-End Object Detection with Transformers
+    <https://arxiv.org/pdf/2005.12872>`_ for details.
+    Args:
+        encoder (`mmcv.ConfigDict` | Dict): Config of
+            TransformerEncoder. Defaults to None.
+        decoder ((`mmcv.ConfigDict` | Dict)): Config of
+            TransformerDecoder. Defaults to None
+        init_cfg (obj:`mmcv.ConfigDict`): The Config for initialization.
+            Defaults to None.
+    """
+
+    def __init__(self, encoder=None, decoder=None, init_cfg=None, cross=False):
+        super(PETRTransformer, self).__init__(init_cfg=init_cfg)
+        if encoder is not None:
+            self.encoder = build_transformer_layer_sequence(encoder)
+        else:
+            self.encoder = None
+        self.decoder = build_transformer_layer_sequence(decoder)
+        self.embed_dims = self.decoder.embed_dims
+        self.cross = cross
+
+    def init_weights(self):
+        # follow the official DETR to init parameters
+        for m in self.modules():
+            if hasattr(m, 'weight') and m.weight.dim() > 1:
+                xavier_init(m, distribution='uniform')
+        self._is_init = True
+
+
+    def forward(self, x, mask, query_embed, pos_embed, reg_branch=None):
+        """Forward function for `Transformer`.
+        Args:
+            x (Tensor): Input query with shape [bs, c, h, w] where
+                c = embed_dims.
+            mask (Tensor): The key_padding_mask used for encoder and decoder,
+                with shape [bs, h, w].
+            query_embed (Tensor): The query embedding for decoder, with shape
+                [num_query, c].
+            pos_embed (Tensor): The positional encoding for encoder and
+                decoder, with the same shape as `x`.
+        Returns:
+            tuple[Tensor]: results of decoder containing the following tensor.
+                - out_dec: Output from decoder. If return_intermediate_dec \
+                      is True output has shape [num_dec_layers, bs,
+                      num_query, embed_dims], else has shape [1, bs, \
+                      num_query, embed_dims].
+                - memory: Output results from encoder, with shape \
+                      [bs, embed_dims, h, w].
+        """
+        bs, n, c, h, w = x.shape
+        memory = x.permute(1, 3, 4, 0, 2).reshape(-1, bs, c) # [bs, n, c, h, w] -> [n*h*w, bs, c]
+        pos_embed = pos_embed.permute(1, 3, 4, 0, 2).reshape(-1, bs, c) # [bs, n, c, h, w] -> [n*h*w, bs, c]
+        query_embed = query_embed.unsqueeze(1).repeat(
+            1, bs, 1)  # [num_query, dim] -> [num_query, bs, dim]
+        mask = mask.view(bs, -1)  # [bs, n, h, w] -> [bs, n*h*w]
+        target = torch.zeros_like(query_embed)
+
+        # out_dec: [num_layers, num_query, bs, dim]
+        out_dec = self.decoder(
+            query=target,
+            key=memory,
+            value=memory,
+            key_pos=pos_embed,
+            query_pos=query_embed,
+            key_padding_mask=mask,
+            reg_branch=reg_branch,
+            )
+        out_dec = out_dec.transpose(1, 2)
+        memory = memory.reshape(n, h, w, bs, c).permute(3, 0, 4, 1, 2)
+        return  out_dec, memory
+
 @ATTENTION.register_module()
 class PETRMultiheadAttention(BaseModule):
     """A wrapper for ``torch.nn.MultiheadAttention``.
@@ -164,17 +243,17 @@ class PETRMultiheadAttention(BaseModule):
             key = key.transpose(0, 1)
             value = value.transpose(0, 1)
 
-        out = self.attn(
+        out, attn_weight = self.attn(
             query=query,
             key=key,
             value=value,
             attn_mask=attn_mask,
-            key_padding_mask=key_padding_mask)[0]
+            key_padding_mask=key_padding_mask)
 
         if self.batch_first:
             out = out.transpose(0, 1)
 
-        return identity + self.dropout_layer(self.proj_drop(out))
+        return identity + self.dropout_layer(self.proj_drop(out)), attn_weight
 
 
 from .attention import FlashMHA
@@ -309,16 +388,16 @@ class PETRMultiheadFlashAttention(BaseModule):
             key = key.transpose(0, 1)
             value = value.transpose(0, 1)
         
-        out = self.attn(
+        out, attn_weight = self.attn(
             q=query,
             k=key,
             v=value,
-            key_padding_mask=None)[0]
+            key_padding_mask=None)
 
         if self.batch_first:
             out = out.transpose(0, 1)
 
-        return identity + self.dropout_layer(self.proj_drop(out))
+        return identity + self.dropout_layer(self.proj_drop(out)), attn_weight
 
 
 @TRANSFORMER_LAYER_SEQUENCE.register_module()
@@ -360,15 +439,17 @@ class PETRTransformerDecoder(TransformerLayerSequence):
                 x = self.post_norm(x)[None]
             return x
 
-        intermediate = []
+        intermediate, attn_weights = [], []
         for layer in self.layers:
-            query = layer(query, *args, **kwargs)
+            query, attn_weight = layer(query, *args, **kwargs)
             if self.return_intermediate:
                 if self.post_norm is not None:
                     intermediate.append(self.post_norm(query))
+                    attn_weights.append(attn_weight)
                 else:
                     intermediate.append(query)
-        return torch.stack(intermediate)
+                    attn_weights.append(attn_weight)
+        return torch.stack(intermediate), attn_weights
 
 
 @TRANSFORMER_LAYER.register_module()
@@ -426,23 +507,83 @@ class PETRTransformerDecoderLayer(BaseTransformerLayer):
                 attn_masks=None,
                 query_key_padding_mask=None,
                 key_padding_mask=None,
+                **kwargs
                 ):
         """Forward function for `TransformerCoder`.
         Returns:
             Tensor: forwarded results with shape [num_query, bs, embed_dims].
         """
-        x = super(PETRTransformerDecoderLayer, self).forward(
-                query,
-                key=key,
-                value=value,
-                query_pos=query_pos,
-                key_pos=key_pos,
-                attn_masks=attn_masks,
-                query_key_padding_mask=query_key_padding_mask,
-                key_padding_mask=key_padding_mask,
-                )
+        # x = super(PETRTransformerDecoderLayer, self).forward(
+        #         query,
+        #         key=key,
+        #         value=value,
+        #         query_pos=query_pos,
+        #         key_pos=key_pos,
+        #         attn_masks=attn_masks,
+        #         query_key_padding_mask=query_key_padding_mask,
+        #         key_padding_mask=key_padding_mask,
+        #         )
 
-        return x
+        # return x
+    
+        norm_index = 0
+        attn_index = 0
+        ffn_index = 0
+        identity = query
+        if attn_masks is None:
+            attn_masks = [None for _ in range(self.num_attn)]
+        elif isinstance(attn_masks, torch.Tensor):
+            attn_masks = [
+                copy.deepcopy(attn_masks) for _ in range(self.num_attn)
+            ]
+            warnings.warn(f'Use same attn_mask in all attentions in '
+                          f'{self.__class__.__name__} ')
+        else:
+            assert len(attn_masks) == self.num_attn, f'The length of ' \
+                        f'attn_masks {len(attn_masks)} must be equal ' \
+                        f'to the number of attention in ' \
+                        f'operation_order {self.num_attn}'
+
+        for layer in self.operation_order:
+            if layer == 'self_attn':
+                temp_key = temp_value = query
+                query = self.attentions[attn_index](
+                    query,
+                    temp_key,
+                    temp_value,
+                    identity if self.pre_norm else None,
+                    query_pos=query_pos,
+                    key_pos=query_pos,
+                    attn_mask=attn_masks[attn_index],
+                    key_padding_mask=query_key_padding_mask,
+                    **kwargs)
+                attn_index += 1
+                identity = query
+
+            elif layer == 'norm':
+                query = self.norms[norm_index](query)
+                norm_index += 1
+
+            elif layer == 'cross_attn':
+                query, attn_weight = self.attentions[attn_index](
+                    query,
+                    key,
+                    value,
+                    identity if self.pre_norm else None,
+                    query_pos=query_pos,
+                    key_pos=key_pos,
+                    attn_mask=attn_masks[attn_index],
+                    key_padding_mask=key_padding_mask,
+                    **kwargs)
+                attn_index += 1
+                identity = query
+
+            elif layer == 'ffn':
+                query = self.ffns[ffn_index](
+                    query, identity if self.pre_norm else None)
+                ffn_index += 1
+
+        return query, attn_weight
 
     def forward(self, 
                 query,
@@ -461,7 +602,7 @@ class PETRTransformerDecoderLayer(BaseTransformerLayer):
         """
 
         if self.use_checkpoint and self.training:
-            x = cp.checkpoint(
+            x, attn_weight = cp.checkpoint(
                 self._forward, 
                 query,
                 key,
@@ -473,7 +614,7 @@ class PETRTransformerDecoderLayer(BaseTransformerLayer):
                 key_padding_mask,
                 )
         else:
-            x = self._forward(
+            x, attn_weight = self._forward(
             query,
             key=key,
             value=value,
@@ -484,4 +625,4 @@ class PETRTransformerDecoderLayer(BaseTransformerLayer):
             key_padding_mask=key_padding_mask
             )
         
-        return x
+        return x, attn_weight

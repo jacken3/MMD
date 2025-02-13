@@ -1,8 +1,4 @@
-from .cmt_head import (
-    SeparateTaskHead,
-    CmtHead,
-    CmtImageHead,
-    CmtLidarHead
-)
 
-__all__ = ['SeparateTaskHead', 'CmtHead', 'CmtLidarHead', 'CmtImageHead']
+from .ICFusion_head import ICFusionHead, SeparateTaskHead
+
+__all__ = ["SeparateTaskHead", "ICFusionHead"]

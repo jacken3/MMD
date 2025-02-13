@@ -17,25 +17,44 @@ from os import path as osp
 from mmcv.runner import force_fp32, auto_fp16
 from mmdet.core import multi_apply
 from mmdet.models import DETECTORS
-from mmdet.models.builder import build_backbone
+from mmdet.models.builder import build_detector
+from mmdet3d.models.builder import build_neck
 from mmdet3d.core import (Box3DMode, Coord3DMode, bbox3d2result,
                           merge_aug_bboxes_3d, show_result)
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
 
 from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
 from projects.mmdet3d_plugin import SPConvVoxelization
+from mmdet.core.visualization.image import imshow_det_bboxes
 
 
 @DETECTORS.register_module()
-class CmtDetector(MVXTwoStageDetector):
+class ICFusionDetector(MVXTwoStageDetector):
 
     def __init__(self,
+                 if_2d_prior=False,
+                 extra_fpn = False,
+                 extra_neck=None,
+                 bbox_head_2d=None,
+                 if_3d_detection=True,
                  use_grid_mask=False,
                  **kwargs):
         pts_voxel_cfg = kwargs.get('pts_voxel_layer', None)
         kwargs['pts_voxel_layer'] = None
-        super(CmtDetector, self).__init__(**kwargs)
+        if if_3d_detection:
+            kwargs['pts_bbox_head']['if_2d_prior'] = if_2d_prior
+        super(ICFusionDetector, self).__init__(**kwargs)
         
+        self.if_2d_prior = if_2d_prior
+        self.extra_fpn = extra_fpn
+        if extra_fpn and self.if_2d_prior:
+            assert extra_neck is not None
+            self.extra_neck = build_neck(extra_neck)
+        self.if_3d_detection = if_3d_detection
+        if if_2d_prior:
+            assert bbox_head_2d is not None
+            self.detector_2d = build_detector(bbox_head_2d)
+
         self.use_grid_mask = use_grid_mask
         self.grid_mask = GridMask(True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7)
         if pts_voxel_cfg:
@@ -43,7 +62,7 @@ class CmtDetector(MVXTwoStageDetector):
 
     def init_weights(self):
         """Initialize model weights."""
-        super(CmtDetector, self).init_weights()
+        super(ICFusionDetector, self).init_weights()
 
     @auto_fp16(apply_to=('img'), out_fp32=True) 
     def extract_img_feat(self, img, img_metas):
@@ -77,14 +96,13 @@ class CmtDetector(MVXTwoStageDetector):
             return None
         if pts is None:
             return None
-        if not hasattr(self, 'pts_voxel_layer'):
-            return None
         voxels, num_points, coors = self.voxelize(pts)
         voxel_features = self.pts_voxel_encoder(voxels, num_points, coors,
                                                 )
         batch_size = coors[-1, 0] + 1
         x = self.pts_middle_encoder(voxel_features, coors, batch_size)
-        x = self.pts_backbone(x)
+        if self.with_pts_backbone:
+            x = self.pts_backbone(x)
         if self.with_pts_neck:
             x = self.pts_neck(x)
         return x
@@ -115,16 +133,55 @@ class CmtDetector(MVXTwoStageDetector):
             coors_batch.append(coor_pad)
         coors_batch = torch.cat(coors_batch, dim=0)
         return voxels, num_points, coors_batch
+
+    def visualize_2d(self, proposals, gt_bboxes, gt_labels, img_metas, imgs):
+
+        def denormalize(img, img_norm_config):
+            img = img.permute(1, 2, 0).numpy().astype(np.float64)
+            img = mmcv.imdenormalize(img, img_norm_config['mean'], img_norm_config['std'], img_norm_config['to_rgb'])
+            return img
+        """Visualize 2D detection results."""
+        for i in range(len(proposals)):
+            file_name = 'visual/' + '/'.join(img_metas[i//6]['filename'][i%6].split('/')[-2:])
+            img = denormalize(imgs[i // 6][i % 6].cpu(), img_metas[0]['img_norm_cfg'])
+            img = imshow_det_bboxes(
+                    img,
+                    gt_bboxes[i].cpu().numpy(),
+                    gt_labels[i].cpu().numpy(),
+                    class_names=[
+                                'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
+                                'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
+                                ],
+                    bbox_color='red',
+                    text_color='red',
+                    show=False,
+                    out_file=None)
+            
+            img = imshow_det_bboxes(
+                        img,
+                        proposals[i][:, :5].cpu().numpy(),
+                        proposals[i][:, 5].cpu().numpy().astype(np.int32),
+                        class_names=[
+                                'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
+                                'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
+                                ],
+                        bbox_color='green',
+                        text_color='green',
+                        show=False,
+                        out_file=None)
+            mmcv.imwrite(img, file_name)
+    
     def forward_train(self,
                       points=None,
                       img_metas=None,
                       gt_bboxes_3d=None,
                       gt_labels_3d=None,
-                      gt_labels=None,
-                      gt_bboxes=None,
+                      gt_labels_2d=None,
+                      gt_bboxes_2d=None,
                       img=None,
                       proposals=None,
-                      gt_bboxes_ignore=None):
+                      gt_bboxes_ignore=None,
+                      **kwargs):
         """Forward training function.
 
         Args:
@@ -136,9 +193,9 @@ class CmtDetector(MVXTwoStageDetector):
                 Ground truth 3D boxes. Defaults to None.
             gt_labels_3d (list[torch.Tensor], optional): Ground truth labels
                 of 3D boxes. Defaults to None.
-            gt_labels (list[torch.Tensor], optional): Ground truth labels
+            gt_labels_2d (list[torch.Tensor], optional): Ground truth labels
                 of 2D boxes in images. Defaults to None.
-            gt_bboxes (list[torch.Tensor], optional): Ground truth 2D boxes in
+            gt_bboxes_2d (list[torch.Tensor], optional): Ground truth 2D boxes in
                 images. Defaults to None.
             img (torch.Tensor optional): Images of each sample with shape
                 (N, C, H, W). Defaults to None.
@@ -153,10 +210,36 @@ class CmtDetector(MVXTwoStageDetector):
 
         img_feats, pts_feats = self.extract_feat(
             points, img=img, img_metas=img_metas)
+        assert img_feats is not None or pts_feats is not None
         losses = dict()
-        if pts_feats or img_feats:
+        if self.if_2d_prior:
+            assert img_feats is not None
+            # 训练2D检测器
+            gt_bboxes_2d_list, gt_labels_2d_list, gt_bboxes_ignore_list = [], [], []
+            for gt_bbox_2d, gt_label_2d, gt_bbox_ignore in zip(gt_bboxes_2d, gt_labels_2d, gt_bboxes_ignore):
+                gt_bboxes_2d_list.extend(gt_bbox_2d)
+                gt_labels_2d_list.extend(gt_label_2d)
+                gt_bboxes_ignore_list.extend(gt_bbox_ignore)
+            losses, proposals = self.detector_2d.forward_train(img_feats, img_metas, gt_bboxes_2d_list, gt_labels_2d_list, gt_bboxes_ignore_list)
+            if self.if_3d_detection:
+                with torch.no_grad():
+                    proposals = self.detector_2d.forward_test(img_feats, img_metas, proposals)
+                    proposals = self.detector_2d.process_prosals(proposals, img.device)
+                    if False:
+                        self.visualize_2d(proposals, gt_bboxes_2d_list, gt_labels_2d_list, img_metas, img)
+                    if self.detector_2d.train_cfg['detection_proposal'].get('complement_2d_gt', -1) > 0:
+                        gt_proposals = self.detector_2d.process_gt(gt_bboxes_2d_list, gt_labels_2d_list, img.device)
+                        proposals = self.detector_2d.merge_aug_bboxes_2d(proposals, gt_proposals, thr=self.detector_2d.train_cfg['detection_proposal'].get('complement_2d_gt'))
+        else:
+            proposals = None
+        if self.if_3d_detection:
+            if self.if_2d_prior:
+                if self.extra_fpn:
+                    img_feats = self.extra_neck(img_feats)
+                else:
+                    img_feats = img_feats[-3:]       
             losses_pts = self.forward_pts_train(pts_feats, img_feats, gt_bboxes_3d,
-                                                gt_labels_3d, img_metas,
+                                                gt_labels_3d, img_metas, proposals,
                                                 gt_bboxes_ignore)
             losses.update(losses_pts)
         return losses
@@ -168,6 +251,7 @@ class CmtDetector(MVXTwoStageDetector):
                           gt_bboxes_3d,
                           gt_labels_3d,
                           img_metas,
+                          proposals=None,
                           gt_bboxes_ignore=None):
         """Forward function for point cloud branch.
 
@@ -188,7 +272,7 @@ class CmtDetector(MVXTwoStageDetector):
             pts_feats = [None]
         if img_feats is None:
             img_feats = [None]
-        outs = self.pts_bbox_head(pts_feats, img_feats, img_metas)
+        outs = self.pts_bbox_head(pts_feats, img_feats, img_metas, proposals)
         loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
         losses = self.pts_bbox_head.loss(*loss_inputs)
         return losses
@@ -221,6 +305,9 @@ class CmtDetector(MVXTwoStageDetector):
         Q, N, H_feat, W_feat = attn_weights2visual.shape
         # img.shape = [N, 3, H_img, W_img]
         _, C, H_img, W_img = img.shape
+
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
 
         for q_idx in range(Q):
             attn_map_q = attn_weights2visual[q_idx]  
@@ -264,24 +351,25 @@ class CmtDetector(MVXTwoStageDetector):
                 overlay = out_pil.convert('RGB')                  # 转回 RGB (H×W×3)
 
                 # 转回 numpy array (uint8, 0~255)
-                overlay = np.array(overlay, dtype=np.uint8)
+                # overlay = np.array(overlay, dtype=np.uint8)
 
-                plt.figure(figsize=(10, 5))
-                plt.suptitle(f"Query {q_idx}, Camera {cam_idx} (Unified Norm)", fontsize=14)
+                # plt.figure(figsize=(10, 5))
+                # plt.suptitle(f"Query {q_idx}, Camera {cam_idx} (Unified Norm)", fontsize=14)
 
-                plt.subplot(1, 2, 1)
-                plt.imshow(img_cam_np)
-                plt.title("Original Image")
-                plt.axis("off")
+                # plt.subplot(1, 2, 1)
+                # plt.imshow(img_cam_np)
+                # plt.title("Original Image")
+                # plt.axis("off")
 
-                plt.subplot(1, 2, 2)
-                plt.imshow(overlay)
-                plt.title("Attn Overlay")
-                plt.axis("off")
+                # plt.subplot(1, 2, 2)
+                # plt.imshow(overlay)
+                # plt.title("Attn Overlay")
+                # plt.axis("off")
 
                 save_path = os.path.join(save_dir, f"query_{q_idx}_cam_{cam_idx}.png")
-                plt.savefig(save_path, bbox_inches='tight')
-                plt.close()  # 关闭图窗，防止内存占用过多
+                overlay.save(save_path, format='PNG')
+                # plt.savefig(save_path, bbox_inches='tight')
+                # plt.close()  # 关闭图窗，防止内存占用过多
 
     def forward_test(self,
                      points=None,
@@ -310,18 +398,19 @@ class CmtDetector(MVXTwoStageDetector):
                     name, type(var)))
 
         result, bbox_index, attn_weights = self.simple_test(points[0], img_metas[0], img[0], **kwargs)
-        bbox_index = [index.cpu().numpy() for index in bbox_index]
-        attn_weights = [attn.cpu() for attn in attn_weights]
+        if False:
+            bbox_index = [index.cpu().numpy() for index in bbox_index]
+            attn_weights = [attn.cpu() for attn in attn_weights]
 
-        attn_weights2visual = attn_weights[3][0][bbox_index[0][torch.where(result[0]['pts_bbox']['scores_3d'] > 0.4)[0]]].reshape(-1,6,20,50)
-        self.visualize_attention_maps(attn_weights2visual, img[0], alpha=0.5)
+            attn_weights2visual = attn_weights[3][0][bbox_index[0][torch.where(result[0]['pts_bbox']['scores_3d'] > 0.4)[0]]].reshape(-1,6,20,50)
+            self.visualize_attention_maps(attn_weights2visual, img[0], alpha=0.5, save_dir='visual/dep_2dPrior/'+img_metas[0][0]['sample_idx'])
     
         return result
     
     @force_fp32(apply_to=('x', 'x_img'))
-    def simple_test_pts(self, x, x_img, img_metas, rescale=False):
+    def simple_test_pts(self, x, x_img, img_metas, proposals=None, rescale=False):
         """Test function of point cloud branch."""
-        outs = self.pts_bbox_head(x, x_img, img_metas)
+        outs = self.pts_bbox_head(x, x_img, img_metas, proposals)
         bbox_list, bbox_index = self.pts_bbox_head.get_bboxes(
             outs, img_metas, rescale=rescale)
         bbox_results = [
@@ -339,9 +428,22 @@ class CmtDetector(MVXTwoStageDetector):
             img_feats = [None]
         
         bbox_list = [dict() for i in range(len(img_metas))]
+        if self.if_2d_prior:
+            assert img_feats is not None
+            proposals = self.detector_2d.forward_test(img_feats, img_metas)
+            proposals = self.detector_2d.process_prosals(proposals, img.device)
+        else:
+            proposals = None
+        # for i in range(len(bbox_list)):
+        #     bbox_list[i]['img_bbox'] = proposals[i]
         if (pts_feats or img_feats) and self.with_pts_bbox:
+            if self.if_2d_prior:
+                if self.extra_fpn:
+                    img_feats = self.extra_neck(img_feats)
+                else:
+                    img_feats = img_feats[-3:]    
             bbox_pts, bbox_index, attn_weights = self.simple_test_pts(
-                pts_feats, img_feats, img_metas, rescale=rescale)
+                pts_feats, img_feats, img_metas, proposals, rescale=rescale)
             for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
                 result_dict['pts_bbox'] = pts_bbox
         if img_feats and self.with_img_bbox:

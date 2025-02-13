@@ -125,7 +125,7 @@ test_pipeline = [
 ]
 data = dict(
     samples_per_gpu=2,
-    workers_per_gpu=6,
+    workers_per_gpu=0,
     train=dict(
         type='CBGSDataset',
         dataset=dict(
@@ -134,8 +134,8 @@ data = dict(
             ann_file=data_root + '/nuscenes_infos_train.pkl',
             load_interval=1,
             pipeline=train_pipeline,
-            classes=class_names,
             ft_begin_epoch=15,
+            classes=class_names,
             modality=input_modality,
             test_mode=False,
             box_type_3d='LiDAR')),
@@ -160,7 +160,7 @@ data = dict(
         test_mode=True,
         box_type_3d='LiDAR'))
 model = dict(
-    type='CmtDetector',
+    type='ICFusionDetector',
     pts_voxel_layer=dict(
         num_point_features=5,
         max_num_points=10,
@@ -197,30 +197,27 @@ model = dict(
         upsample_cfg=dict(type='deconv', bias=False),
         use_conv_for_no_stride=True),
     pts_bbox_head=dict(
-        type='CmtLidarHead',
-        in_channels=512,
+        type='ICFusionHead',
+        input_modality=dict(
+                    use_lidar=True,
+                    use_camera=False,
+                 ),
+        num_classes=10,
+        with_dn=True,
+        pts_in_channels=512,
         hidden_dim=256,
+        query_3dpe=False,
+        bg_cls_weight=0.1, #背景类的权重, 在CMT里面取的是0.1
         downsample_scale=8,
-        common_heads=dict(center=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2)),
-        tasks=[
-            dict(num_class=10, class_names=[
-                'car', 'truck', 'construction_vehicle',
-                'bus', 'trailer', 'barrier',
-                'motorcycle', 'bicycle',
-                'pedestrian', 'traffic_cone'
-            ]),
-        ],
         bbox_coder=dict(
-            type='MultiTaskBBoxCoder',
+            type='NMSFreeCoder',
             post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
             pc_range=point_cloud_range,
             max_num=300,
             voxel_size=voxel_size,
             num_classes=10), 
-        separate_head=dict(
-            type='SeparateTaskHead', init_bias=-2.19, final_kernel=3),
         transformer=dict(
-            type='CmtLidarTransformer',
+            type='CmtTransformer',
             decoder=dict(
                 type='PETRTransformerDecoder',
                 return_intermediate=True,
@@ -247,8 +244,7 @@ model = dict(
                         ffn_drop=0.,
                         act_cfg=dict(type='ReLU', inplace=True),
                     ),
-
-                    feedforward_channels=1024, #unused
+                    feedforward_channels=1024,#unused
                     operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
                                      'ffn', 'norm')),
             )),
@@ -317,3 +313,4 @@ resume_from = None
 workflow = [('train', 1)]
 gpu_ids = range(0, 8)
 custom_hooks = [dict(type='CustomSetEpochInfoHook')]
+

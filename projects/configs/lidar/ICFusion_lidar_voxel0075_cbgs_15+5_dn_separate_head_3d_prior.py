@@ -8,6 +8,7 @@ class_names = [
 ]
 voxel_size = [0.075, 0.075, 0.2]
 out_size_factor = 8
+num_layers = 6
 evaluation = dict(interval=20)
 dataset_type = 'CustomNuScenesDataset'
 data_root = 'data/nuscenes/'
@@ -134,8 +135,8 @@ data = dict(
             ann_file=data_root + '/nuscenes_infos_train.pkl',
             load_interval=1,
             pipeline=train_pipeline,
-            classes=class_names,
             ft_begin_epoch=15,
+            classes=class_names,
             modality=input_modality,
             test_mode=False,
             box_type_3d='LiDAR')),
@@ -160,7 +161,7 @@ data = dict(
         test_mode=True,
         box_type_3d='LiDAR'))
 model = dict(
-    type='CmtDetector',
+    type='ICFusionDetector',
     pts_voxel_layer=dict(
         num_point_features=5,
         max_num_points=10,
@@ -172,55 +173,54 @@ model = dict(
         num_features=5,
     ),
     pts_middle_encoder=dict(
-        type='SparseEncoder',
+        type='VoxelNextEncoder',
         in_channels=5,
         sparse_shape=[41, 1440, 1440],
-        output_channels=128,
+        base_channels=32,
+        output_channels=256,
+        encoder_channels=((32, 32), (64, 64, 64), (128, 128, 128), (256, 256, 256),(256, 256, 256),(256, 256, 256)),
+        sparse_conv_kernel = (5, 3, 3, 3, 3),
         order=('conv', 'norm', 'act'),
-        encoder_channels=((16, 16, 32), (32, 32, 64), (64, 64, 128), (128, 128)),
-        encoder_paddings=((0, 0, 1), (0, 0, 1), (0, 0, [0, 1, 1]), (0, 0)),
         block_type='basicblock'),
-    pts_backbone=dict(
-        type='SECOND',
-        in_channels=256,
-        out_channels=[128, 256],
-        layer_nums=[5, 5],
-        layer_strides=[1, 2],
-        norm_cfg=dict(type='BN', eps=0.001, momentum=0.01),
-        conv_cfg=dict(type='Conv2d', bias=False)),
-    pts_neck=dict(
-        type='SECONDFPN',
-        in_channels=[128, 256],
-        out_channels=[256, 256],
-        upsample_strides=[1, 2],
-        norm_cfg=dict(type='BN', eps=0.001, momentum=0.01),
-        upsample_cfg=dict(type='deconv', bias=False),
-        use_conv_for_no_stride=True),
     pts_bbox_head=dict(
-        type='CmtLidarHead',
-        in_channels=512,
+        type='ICFusionHead',
+        num_query=500,
+        input_modality=dict(
+                    use_lidar=True,
+                    use_camera=False,
+                 ),
+        num_classes=10,
+        with_dn=True,
+        pts_in_channels=256,
         hidden_dim=256,
+        query_3dpe=False,
+        bg_cls_weight=0.1, #背景类的权重, 在CMT里面取的是0.1
         downsample_scale=8,
-        common_heads=dict(center=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2)),
-        tasks=[
-            dict(num_class=10, class_names=[
-                'car', 'truck', 'construction_vehicle',
-                'bus', 'trailer', 'barrier',
-                'motorcycle', 'bicycle',
-                'pedestrian', 'traffic_cone'
-            ]),
-        ],
+        if_3d_prior=True,
+        heatmap_layer=dict(
+            num_conv = 2,
+            proposal_head_kernel = 3
+        ),
+        max_foreground_token=10000,
+        num_3d_proposals=200,
+        use_separate_head=True,
+        separate_head=dict(
+            type='SeparateTaskHead', 
+            in_channels=256, # hidden_dim
+            heads = dict(center=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2), vel=(2, 2), cls_logits=(10, 2)),
+            groups=num_layers, # decoder_layers
+            head_conv=64,
+            final_kernel=3,
+            init_bias=-2.19),
         bbox_coder=dict(
-            type='MultiTaskBBoxCoder',
+            type='NMSFreeCoder',
             post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
             pc_range=point_cloud_range,
             max_num=300,
             voxel_size=voxel_size,
             num_classes=10), 
-        separate_head=dict(
-            type='SeparateTaskHead', init_bias=-2.19, final_kernel=3),
         transformer=dict(
-            type='CmtLidarTransformer',
+            type='CmtTransformer',
             decoder=dict(
                 type='PETRTransformerDecoder',
                 return_intermediate=True,
@@ -247,8 +247,7 @@ model = dict(
                         ffn_drop=0.,
                         act_cfg=dict(type='ReLU', inplace=True),
                     ),
-
-                    feedforward_channels=1024, #unused
+                    feedforward_channels=1024,#unused
                     operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
                                      'ffn', 'norm')),
             )),
@@ -317,3 +316,4 @@ resume_from = None
 workflow = [('train', 1)]
 gpu_ids = range(0, 8)
 custom_hooks = [dict(type='CustomSetEpochInfoHook')]
+

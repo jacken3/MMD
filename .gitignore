@@ -143,3 +143,7 @@ data/sunrgbd/OFFICIAL_SUNRGBD/
 # Waymo evaluation
 mmdet3d/core/evaluation/waymo_utils/compute_detection_metrics_main
 test/
+depth_visual/
+debug_save/
+debug*/
+visual*/
