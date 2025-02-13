@@ -185,7 +185,7 @@ class NMSFreeCoder(BaseBBoxCoder):
         Returns:
             list[dict]: Decoded boxes.
         """
-        max_num = self.max_num
+        max_num = min(self.max_num, cls_scores.shape[0])
 
         cls_scores = cls_scores.sigmoid()
         scores, indexs = cls_scores.view(-1).topk(max_num)

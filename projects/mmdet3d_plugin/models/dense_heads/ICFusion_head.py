@@ -35,8 +35,11 @@ from mmdet.models.builder import build_roi_extractor
 
 from functools import reduce
 from projects.mmdet3d_plugin.core.bbox.util import normalize_bbox
+from mmdet3d.ops import  make_sparse_convmodule
+import spconv.pytorch as spconv
 from projects.mmdet3d_plugin.models.utils.query_generator import QueryGenerator
 from projects.mmdet3d_plugin.models.utils.gaussian import gaussian_radius
+from spconv.core import ConvAlgo
 
 
 def pos2embed(pos, num_pos_feats=128, temperature=10000):
@@ -345,15 +348,26 @@ class ICFusionHead(BaseModule):
         else:
             self.cls_out_channels = num_classes + 1
 
-        if input_modality['use_lidar']:   
-            self.shared_conv = ConvModule(
-                pts_in_channels,
-                hidden_dim,
-                kernel_size=3,
-                padding=1,
-                conv_cfg=dict(type="Conv2d"),
-                norm_cfg=dict(type="BN2d")
-            )
+        if input_modality['use_lidar']:
+            if not self.if_3d_prior:
+                self.shared_conv = ConvModule(
+                    pts_in_channels,
+                    hidden_dim,
+                    kernel_size=3,
+                    padding=1,
+                    conv_cfg=dict(type="Conv2d"),
+                    norm_cfg=dict(type="BN2d")
+                )
+            else:
+                self.shared_conv = make_sparse_convmodule(
+                    pts_in_channels,
+                    hidden_dim,
+                    (3,3),
+                    norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01),
+                    padding=(1,1),
+                    indice_key='head_spconv_1',
+                    conv_type='SubMConv2d',
+                    order=('conv', 'norm', 'act'))
 
             if not self.lidar_3d_pe and self.query_3dpe:
                 self.bev_2d_embedding = nn.Sequential(
@@ -456,30 +470,36 @@ class ICFusionHead(BaseModule):
                 del self.bbox_roi_extractor.fp16_enabled
 
         if self.if_3d_prior:
-            self.maxpool_2d = nn.MaxPool2d(kernel_size=3, stride=1, padding=1)
-            self.maxpool_2d_small = nn.MaxPool2d(kernel_size=1, stride=1, padding=0)
-
+         
+            self.sparse_maxpool_2d = spconv.SparseMaxPool2d(3, 1, 1, subm=True, algo=ConvAlgo.Native, indice_key='max_pool_head_3')
+            self.sparse_maxpool_2d_small = spconv.SparseMaxPool2d(1, 1, 0, subm=True, algo=ConvAlgo.Native, indice_key='max_pool_head_3')
             num_conv = self.heatmap_layer['num_conv']
             proposal_head_kernel = self.heatmap_layer['proposal_head_kernel']
             fc_list = []
-            fc_list = []
             for _ in range(num_conv - 1):
                 fc_list.append(
-                    nn.Sequential(
-                        nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=proposal_head_kernel, padding=proposal_head_kernel//2, bias=False),
-                        nn.BatchNorm2d(self.hidden_dim, eps=1e-3, momentum=0.01),
-                        nn.ReLU(inplace=True)
-                    )
+                    make_sparse_convmodule(
+                    self.hidden_dim,
+                    self.hidden_dim,
+                    proposal_head_kernel,
+                    norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01),
+                    padding=int(proposal_head_kernel//2),
+                    indice_key='head_spconv_1',
+                    conv_type='SubMConv2d',
+                    order=('conv', 'norm', 'act')),
                 )
-            fc_list.append(
-                nn.Conv2d(self.hidden_dim, self.num_classes, kernel_size=1, stride=1, padding=0, bias=True)
-            )
+            fc_list.append(build_conv_layer(
+                            dict(type='SubMConv2d', indice_key='hm_out'),
+                            self.hidden_dim,
+                            self.num_classes,
+                            1,
+                            stride=1,
+                            padding=0,
+                            bias=True))
             self.heatmap_layer = nn.Sequential(*fc_list)
-            # 初始化偏置
             self.heatmap_layer[-1].bias.data.fill_(-2.19)
 
     def init_weights(self):
-        # super(ICFusionHead, self).init_weights()
         self.transformer.init_weights()
         nn.init.uniform_(self.reference_points.weight.data, 0, 1)
         if not self.use_separate_head:
@@ -714,57 +734,103 @@ class ICFusionHead(BaseModule):
 
         return reference_points
 
-    def generate_3d_reference_points(self, x, x_pos_embeds, reference_points, bs):
+    def get_query_init(self, ref_points, sparse_feature, feature_pos, feature_batch_inds):
+        total_range = self.pc_range[3]-self.pc_range[0]
+        radius = 1
+        diameter = (2 * radius + 1)/total_range
+        sigma = diameter / 6
+        query_feature_list = []
+        batch_size = ref_points.shape[0]
 
-        device, dtype = x.device, x.dtype
-        x_feature = x.clone()  # [B, C, H, W]
-        B, C, H, W = x_feature.shape
+        for bs in range(batch_size):
+            sample_q = ref_points[bs][:,:2]
+            sample_mask = feature_batch_inds[:,0] == bs
+            sample_token = sparse_feature[sample_mask]
+            sample_pos = feature_pos[sample_mask]
+            with torch.no_grad():
+                dis_mat = sample_q.unsqueeze(1) - sample_pos.unsqueeze(0)
+                dis_mat = -(dis_mat ** 2).sum(-1)
+                nearest_dis_topk,nearest_order_topk = dis_mat.topk(1 ,dim=1,sorted= True)
+                gaussian_weight = torch.exp( nearest_dis_topk / (2 * sigma * sigma))
+                gaussian_weight_sum = torch.clip(gaussian_weight.sum(-1),1)
+            
+            flatten_order = nearest_order_topk.view(-1, 1)
+            flatten_weight = (gaussian_weight/gaussian_weight_sum.unsqueeze(1)).view(-1, 1)
+            feature = (sample_token.gather(0, flatten_order.repeat(1,sample_token.shape[1]))*flatten_weight).view(-1,1,sample_token.shape[1]).sum(1).unsqueeze(0)
+            query_feature_list.append(feature)
         
-        heatmap = self.heatmap_layer(x)  # [B, num_classes, H, W]
-        heatmap_clone = heatmap.clone().detach()  # [B, num_classes, H, W]
+        query_feature = torch.cat(query_feature_list,dim=0)
 
-        x_hm_max = self.maxpool_2d(heatmap_clone)  # [B, num_classes, H, W]
-        x_hm_max_small = self.maxpool_2d_small(heatmap_clone)  # [B, num_classes, H, W]
+        return query_feature
 
-        selected = (x_hm_max == heatmap_clone)  # [B, num_classes, H, W]
-        selected_small = (x_hm_max_small == heatmap_clone)  # [B, num_classes, H, W]
+    def generate_3d_reference_points(self, x, reference_points):
+        device, dtype = x.features.device, x.features.dtype
+        x_feature = x.features.clone() # [N, C]
+         
+        x_batch_indices = x.indices[:, :1] # [N, 1]
+        x_ind = x.indices[:, -2:].to(torch.float32)
 
-        selected[:, 8:10, :, :] = selected_small[:, 8:10, :, :]
+        y_size, x_size = x.spatial_shape
+        x_2dpos = torch.zeros(x.indices.shape[0], 2, device=x.features.device)
+        x_2dpos[:, 0] = (x_ind[:, 1] + 0.5) / x_size
+        x_2dpos[:, 1] = (x_ind[:, 0] + 0.5) / y_size
 
-        score = heatmap_clone * selected  # [B, num_classes, H, W]
-        score, _ = score.topk(1, dim=1)  # [B, 1, H, W]
+        batch_size = int(x.batch_size)
 
-        proposal_list = []
-        foreground_feature = torch.zeros(bs, self.max_foreground_token, self.hidden_dim, device=device, dtype=dtype)
-        foreground_bevemb = torch.zeros(bs, self.max_foreground_token, self.hidden_dim, device=device, dtype=dtype)
+        assert not self.lidar_3d_pe
+        x_pos_embeds = self.bev_2d_embedding(pos2embed(x_2dpos, num_pos_feats=self.hidden_dim))
+       
+        heat_map = self.heatmap_layer(x)
+        heat_map_clone = spconv.SparseConvTensor(
+            features=heat_map.features.clone().detach().sigmoid(),
+            indices=heat_map.indices.clone(),
+            spatial_shape=heat_map.spatial_shape,
+            batch_size=heat_map.batch_size
+        ) # [B, num_classes, H, W]
 
-        for i in range(bs):
-            # 对每个批次，找到顶级提案
-            sample_hm = score[i].squeeze(0).view(-1)  # [H*W]
-            sample_x_feature = x_feature[i].view(C, -1)  # [C, H*W]
+        heat_map_max = self.sparse_maxpool_2d(heat_map_clone, True) # [N, num_classes]
+        heat_map_max_small = self.sparse_maxpool_2d_small(heat_map_clone, True) # [N, num_classes]
+
+        selected = (heat_map_max.features == heat_map_clone.features) # [N, num_classes] Boolean
+        selected_small = (heat_map_max_small.features == heat_map_clone.features) # [N, num_classes] Boolean
+
+        selected[:, 8:10] = selected_small[:, 8:10]
+        score = heat_map_clone.features * selected
+        score, _ = score.topk(1, dim=1) # [N, 1]
         
-            _, proposal_ind = sample_hm.topk(self.num_3d_proposals) # 推荐区域ID
-            _, voxel_ind = sample_hm.topk(self.max_foreground_token) # 前景体素ID
+        proposal_list = [] # 保存可能的前景提议区域
+        foreground_feature = torch.zeros(batch_size, self.max_foreground_token, self.hidden_dim, device=device, dtype=dtype)
+        foreground_bevemb = torch.zeros(batch_size, self.max_foreground_token, self.hidden_dim, device=device, dtype=dtype)
 
-            selected_pos = self.coords_bev[proposal_ind].unsqueeze(0).to(device)  # [1, num_3d_proposals, 2]
-            selected_features = sample_x_feature[:, voxel_ind]  # [C, max_foreground_token]
-            selected_bevemb = x_pos_embeds[voxel_ind]  # [max_foreground_token, C]
+        for i in range(batch_size):
+            mask = (x_batch_indices == i).squeeze(-1)
+            sample_token_num = (x_batch_indices==i).sum() # 当前批次的体素数量
+            foreground_token = min(self.max_foreground_token, sample_token_num)
+            
+            sample_hm = score[mask]
+            sample_x_feature = x_feature[mask]
+            sample_x_pos_embeds = x_pos_embeds[mask]
+            sample_2dpos = x_2dpos[mask]
+            _, proposal_ind = sample_hm.topk(self.num_3d_proposals, dim=0) # [num_3d_proposals]
+            _, foreground_ind = sample_hm.topk(foreground_token, dim=0)
+            proposal_list.append(sample_2dpos.gather(0, proposal_ind.repeat(1,2))[None,...])
 
-            foreground_feature[i, :, :] = selected_features.t()
-            foreground_bevemb[i, :, :] = selected_bevemb
+            foreground_feature[i][:foreground_token] = sample_x_feature.gather(0, foreground_ind.repeat(1, sample_x_feature.shape[1]))
+            foreground_bevemb[i][:foreground_token] = sample_x_pos_embeds.gather(0, foreground_ind.repeat(1,sample_x_pos_embeds.shape[1]))
 
-            proposal_list.append(selected_pos)
-        
-        query_pos = torch.cat(proposal_list, dim=0)# 形状：[batch_size, num_3d_proposals, 2]
+        query_pos = torch.cat(proposal_list, dim=0)
         init_reference_points = torch.cat([
             query_pos,
             torch.full((*query_pos.shape[:-1], 1), 0.5, device=query_pos.device)
         ], dim=-1)  # 形状：[batch_size, num_3d_proposals, 3]
 
-        reference_points = reference_points.unsqueeze(0).repeat(bs,1,1)
-        reference_points = torch.cat([init_reference_points, reference_points],dim=1)
+        query_init = self.get_query_init(init_reference_points, x_feature, x_pos_embeds, x_batch_indices)
 
-        return reference_points, foreground_feature, foreground_bevemb, heatmap
+        reference_points = reference_points.unsqueeze(0).repeat(batch_size, 1, 1)
+        reference_points = torch.cat([init_reference_points, reference_points], dim=1)
+        
+
+        return reference_points, foreground_feature, foreground_bevemb, heat_map, query_init
 
     @torch.no_grad()
     def get_box_params(self, bboxes, intrinsics, extrinsics):
@@ -831,6 +897,7 @@ class ICFusionHead(BaseModule):
             return List(dict(head_name: [num_dec x bs x num_query * head_dim]) ) x task_num
         """
         reference_points = self.reference_points.weight # N * 3
+        query_init = None
 
         if self.input_modality['use_camera']:
             assert x_img is not None
@@ -873,15 +940,15 @@ class ICFusionHead(BaseModule):
             heatmap = None
             x = self.shared_conv(x)
 
-            # point_features_pe
-            if not self.lidar_3d_pe:
-                bev_pos_embeds = self.bev_2d_embedding(pos2embed(self.coords_bev.to(x.device), num_pos_feats=self.hidden_dim))
-            else:
-                bev_pos_embeds = self.bev_3d_embedding(pos2emb3d(self.coords_bev.to(x.device)))
-            bs = x.size(0)
             if self.if_3d_prior:
-                reference_points, x, bev_pos_embeds, heatmap = self.generate_3d_reference_points(x, bev_pos_embeds, reference_points, bs)
+                reference_points, x, bev_pos_embeds, heatmap, query_init = self.generate_3d_reference_points(x, reference_points)
+                bs = x.size(0)
             else:
+                if not self.lidar_3d_pe:
+                    bev_pos_embeds = self.bev_2d_embedding(pos2embed(self.coords_bev.to(x.device), num_pos_feats=self.hidden_dim))
+                else:
+                    bev_pos_embeds = self.bev_3d_embedding(pos2emb3d(self.coords_bev.to(x.device)))
+                bs = x.size(0)
                 x = rearrange(x, "b c h w -> b (h w) c")
                 bev_pos_embeds = bev_pos_embeds.unsqueeze(0).repeat(bs, 1, 1)
         else:
@@ -895,9 +962,14 @@ class ICFusionHead(BaseModule):
 
         reference_points, attn_mask, mask_dict = self.prepare_for_dn(bs, reference_points, img_metas)
         query_embeds = self.query_embed(reference_points, img_metas)
+        query = torch.zeros_like(query_embeds)
+
+        if query_init is not None:
+            pad_size = mask_dict['pad_size'] if mask_dict is not None else 0
+            query[:, pad_size:pad_size+query_init.shape[1]] = query_init
 
         outs_dec, _, attn_weights = self.transformer(
-                            x, x_img, query_embeds,
+                            x, x_img, query, query_embeds,
                             bev_pos_embeds, rv_pos_embeds,
                             attn_masks=attn_mask,
                             bs=bs
@@ -1240,93 +1312,133 @@ class ICFusionHead(BaseModule):
                 num_dec_layer += 1
         if preds_dicts.get("heatmap", None) is not None:
             heatmap_pred = preds_dicts['heatmap']
-            hp_target = []
-            for i in range(len(gt_bboxes_3d)):
-                heatmap_target = self.get_heatmap_target_single(
-                    gt_bboxes_3d[i],
-                    gt_labels_3d[i],
-                    heatmap_pred.shape[-2:]
+            spatial_shape, batch_index, voxel_indices, spatial_indices, num_voxels = self._get_voxel_infos(heatmap_pred)
+            hp_target = multi_apply(
+                    self.sparse_hp_target_single,
+                    gt_bboxes_3d,
+                    gt_labels_3d,
+                    num_voxels,
+                    spatial_indices,
                 )
-                hp_target.append(heatmap_target)
-            hp_target = torch.stack(hp_target, dim=0)
-            loss_heatmap = self.loss_heatmap(clip_sigmoid(heatmap_pred), hp_target, avg_factor=max(hp_target.eq(1).float().sum().item(), 1))
+            hp_target = [ t.permute(1,0) for t in hp_target[0]]
+            hp_target = torch.cat(hp_target,dim=0)
+            pred_hm = heatmap_pred.features.clone()
+            loss_heatmap = self.loss_heatmap(clip_sigmoid(pred_hm), hp_target, avg_factor=max(hp_target.eq(1).float().sum().item(), 1))
             loss_dict['loss_heatmap'] = loss_heatmap
 
         return loss_dict
 
-    def get_heatmap_target_single(self, gt_bboxes_3d, gt_labels_3d, feature_map_size):
-        
+    def sparse_hp_target_single(self, gt_bboxes_3d, gt_labels_3d, num_voxels, spatial_indices):
         num_max_objs = 500
         gaussian_overlap = 0.1
         min_radius = 2
-
+        device = gt_labels_3d.device
+        grid_size = torch.tensor(self.train_cfg['grid_size'])
         pc_range = torch.tensor(self.train_cfg['point_cloud_range'])
         voxel_size = torch.tensor(self.train_cfg['voxel_size'])
-        H, W = feature_map_size
+        feature_map_size = grid_size[:2] // self.train_cfg['out_size_factor']  # [x_len, y_len]
+        
 
-        gt_bboxes_3d = gt_bboxes_3d[:, :6]
+        inds = gt_bboxes_3d.new_zeros(num_max_objs).long()
+        mask = gt_bboxes_3d.new_zeros(num_max_objs).long()
+        heatmap = gt_bboxes_3d.new_zeros(self.num_classes, num_voxels)
+        x, y, z = gt_bboxes_3d[:, 0], gt_bboxes_3d[:, 1], gt_bboxes_3d[:, 2]
 
-        heatmap = gt_bboxes_3d.new_zeros((self.num_classes, H, W))
+        coord_x = (x - self.pc_range[0]) / voxel_size[0] / self.downsample_scale
+        coord_y = (y - self.pc_range[1]) / voxel_size[1] / self.downsample_scale
 
-        x, y= gt_bboxes_3d[:, 0], gt_bboxes_3d[:, 1]
-        dx, dy = gt_bboxes_3d[:, 3], gt_bboxes_3d[:, 4]
+        spatial_shape = [self.test_cfg['grid_size'][0] / self.downsample_scale, self.test_cfg['grid_size'][1] / self.downsample_scale]
+        coord_x = torch.clamp(coord_x, min=0, max=spatial_shape[1] - 0.5)  # bugfixed: 1e-6 does not work for center.int()
+        coord_y = torch.clamp(coord_y, min=0, max=spatial_shape[0] - 0.5)  #
 
-        coord_x = (x - pc_range[0]) / voxel_size[0] / self.downsample_scale
-        coord_y = (y - pc_range[1]) / voxel_size[1] / self.downsample_scale
-        coord_x = torch.clamp(coord_x, min=0, max=W - 0.5)  
-        coord_y = torch.clamp(coord_y, min=0, max=H - 0.5) 
-
-        center = torch.stack([coord_y, coord_x], dim=1)  # [num_gt, 2]
+        center = torch.cat((coord_y[:, None], coord_x[:, None]), dim=-1)
         center_int = center.int()
+        center_int_float = center_int.float()
 
+        dx, dy, dz = gt_bboxes_3d[:, 3], gt_bboxes_3d[:, 4], gt_bboxes_3d[:, 5]
         dx = dx / voxel_size[0] / self.downsample_scale
         dy = dy / voxel_size[1] / self.downsample_scale
 
-        radius = gaussian_radius((dx, dy), min_overlap=gaussian_overlap)
+        radius = self.gaussian_radius(dx, dy, min_overlap=gaussian_overlap)
         radius = torch.clamp_min(radius.int(), min=min_radius)
 
         for k in range(min(num_max_objs, gt_bboxes_3d.shape[0])):
             if dx[k] <= 0 or dy[k] <= 0:
                 continue
 
-            if not (0 <= center_int[k][0] <= H and 0 <= center_int[k][1] <= W):
+            if not (0 <= center_int[k][0] <= spatial_shape[1] and 0 <= center_int[k][1] <= spatial_shape[0]):
                 continue
 
             cur_class_id = (gt_labels_3d[k]).long()
+            distance = self.distance(spatial_indices, center[k])
+            inds[k] = distance.argmin()
+            mask[k] = 1
 
-            heatmap[cur_class_id] = self.draw_gaussian_heatmap(
-                heatmap[cur_class_id], center[k], radius[k].item()
-            )
+            # gt_center
+            self.draw_gaussian_to_heatmap_voxels(heatmap[cur_class_id], distance, radius[k].item() * 1)
 
-        return heatmap
+            # nearnest
+            self.draw_gaussian_to_heatmap_voxels(heatmap[cur_class_id], self.distance(spatial_indices, spatial_indices[inds[k]]), radius[k].item() * 1)
 
-    def draw_gaussian_heatmap(self, heatmap, center, radius):
+        return [heatmap]
 
+    def gaussian_radius(self, height, width, min_overlap=0.5):
+        """
+        Args:
+            height: (N)
+            width: (N)
+            min_overlap:
+        Returns:
+        """
+        a1 = 1
+        b1 = (height + width)
+        c1 = width * height * (1 - min_overlap) / (1 + min_overlap)
+        sq1 = (b1 ** 2 - 4 * a1 * c1).sqrt()
+        r1 = (b1 + sq1) / 2
+
+        a2 = 4
+        b2 = 2 * (height + width)
+        c2 = (1 - min_overlap) * width * height
+        sq2 = (b2 ** 2 - 4 * a2 * c2).sqrt()
+        r2 = (b2 + sq2) / 2
+
+        a3 = 4 * min_overlap
+        b3 = -2 * min_overlap * (height + width)
+        c3 = (min_overlap - 1) * width * height
+        sq3 = (b3 ** 2 - 4 * a3 * c3).sqrt()
+        r3 = (b3 + sq3) / 2
+        
+        ret = torch.min(torch.min(r1, r2), r3)
+        return ret
+    
+    def draw_gaussian_to_heatmap_voxels(self, heatmap, distances, radius, k=1):
+    
         diameter = 2 * radius + 1
         sigma = diameter / 6
-        x, y = map(int, center)
-        height, width = heatmap.shape
+        masked_gaussian = torch.exp(- distances / (2 * sigma * sigma))
 
-        left, right = min(x, radius), min(width - x, radius + 1)
-        top, bottom = min(y, radius), min(height - y, radius + 1)
-
-        y1, y2 = y - top, y + bottom
-        x1, x2 = x - left, x + right
-
-        heatmap_slice = heatmap[y1:y2, x1:x2]
-
-        # 生成高斯核
-        x_range = torch.arange(-left, right, dtype=heatmap.dtype, device=heatmap.device)
-        y_range = torch.arange(-top, bottom, dtype=heatmap.dtype, device=heatmap.device)
-        y_cor, x_cor = torch.meshgrid(y_range, x_range)  # 明确指定索引方式
-
-        gaussian = torch.exp(-(x_cor**2 + y_cor**2) / (2 * sigma ** 2))
-
-        # 将高斯核与热图切片取最大值
-        torch.max(heatmap_slice, gaussian, out=heatmap_slice)
+        torch.max(heatmap, masked_gaussian, out=heatmap)
 
         return heatmap
+
+    def distance(self, voxel_indices, center):
+        distances = ((voxel_indices - center.unsqueeze(0))**2).sum(-1)
+        return distances
     
+    def _get_voxel_infos(self, x):
+        spatial_shape = x.spatial_shape
+        voxel_indices = x.indices
+        spatial_indices = []
+        num_voxels = []
+        batch_size = x.batch_size
+        batch_index = voxel_indices[:, 0]
+
+        for bs_idx in range(batch_size):
+            batch_inds = batch_index==bs_idx
+            spatial_indices.append(voxel_indices[batch_inds][:, [1, 2]]) # y, x
+            num_voxels.append(batch_inds.sum())
+
+        return spatial_shape, batch_index, voxel_indices, spatial_indices, num_voxels
 
     @force_fp32(apply_to=('preds_dicts'))
     def get_bboxes(self, preds_dicts, img_metas, img=None, rescale=False):

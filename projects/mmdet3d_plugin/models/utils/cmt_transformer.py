@@ -81,7 +81,7 @@ class CmtTransformer(BaseModule):
                 xavier_init(m, distribution='uniform')
         self._is_init = True
 
-    def forward(self, x, x_img, query_embed, bev_pos_embed, rv_pos_embed, attn_masks=None, reg_branch=None, bs=1):
+    def forward(self, x, x_img, query, query_embed, bev_pos_embed, rv_pos_embed, attn_masks=None, reg_branch=None, bs=1):
         """Forward function for `Transformer`.
         Args:
             x (Tensor): Input query with shape [bs, c, h, w] where
@@ -131,11 +131,10 @@ class CmtTransformer(BaseModule):
         
         # Create padding mask: [bs, n*h*w]
         mask = memory.new_zeros(bs, memory.shape[0]) if memory is not None else None
-        target = torch.zeros_like(query_embed)
         
         # Decoder pass
         out_dec, attn_weights = self.decoder(
-            query=target,
+            query=query,
             key=memory,
             value=memory,
             key_pos=pos_embed,
